@@ -91,11 +91,17 @@ services:
 # inspect without touching the router
 ./mtvpn.py -n add anthropic        # dry-run: print the RouterOS commands
 ./mtvpn.py render anthropic > anthropic.rsc   # for manual /import
+
+# explore upstream lists (no router needed)
+./mtvpn.py search google           # available v2fly service names matching "google"
+./mtvpn.py search                  # ...or the full catalogue
+./mtvpn.py domains openai          # the domains a service resolves to (full: = exact match)
 ```
 
 The router is addressed by a full ssh command string — `ssh: ssh 10.210.10.1`
 in the config, or anything ssh accepts, e.g. `ssh: ssh -J jumphost 10.220.1.1`
-for a router behind a jump host. Everything except `render` takes
+for a router behind a jump host. `render`, `domains`, and `search` never touch
+the router; everything else takes
 `-r "ssh <...>"` to override the config, and one checkout manages several
 routers — keep one config file per router (`./mtvpn.py -c mtvpn-hex.yaml add
 openai`). Legacy JSON configs still load; saves are written as YAML.

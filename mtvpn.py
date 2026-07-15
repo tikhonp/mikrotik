@@ -28,6 +28,7 @@ import urllib.request
 from pathlib import Path
 
 V2FLY_BASE = "https://raw.githubusercontent.com/v2fly/domain-list-community/refs/heads/master/data/"
+V2FLY_TREE_API = "https://api.github.com/repos/v2fly/domain-list-community/git/trees/"
 
 DEFAULTS = {
     "ssh": "",                # full ssh command, e.g. "ssh -J jumphost 10.0.0.1"
@@ -356,6 +357,45 @@ def cmd_render(cfg, args):
         print("\n".join(rsc_service(svc, sub, full, cfg)))
 
 
+def cmd_domains(cfg, args):
+    """Print the resolved domains for service(s) from GitHub. No router needed.
+
+    Subdomain-match domains print as-is; exact (v2fly full:) domains are prefixed
+    `full:` so the two match kinds stay distinguishable.
+    """
+    for name in args.services:
+        svc, url = service_url(name)
+        sub, full, skipped = parse_list(url)
+        report_parse(svc, sub, full, skipped)
+        for d in sorted(sub):
+            print(d)
+        for d in sorted(full):
+            print(f"full:{d}")
+
+
+def list_services():
+    """Available v2fly service names (the filenames under data/).
+
+    Uses the git trees API, not contents: the data/ dir exceeds the contents
+    API's 1000-entry page cap and would silently truncate.
+    """
+    root = json.loads(fetch(V2FLY_TREE_API + "master"))
+    data_sha = next(e["sha"] for e in root["tree"]
+                    if e["path"] == "data" and e["type"] == "tree")
+    tree = json.loads(fetch(V2FLY_TREE_API + data_sha))
+    return sorted(e["path"] for e in tree["tree"] if e["type"] == "blob")
+
+
+def cmd_search(cfg, args):
+    """List available v2fly service names, optionally filtered by substring."""
+    q = args.query.lower() if args.query else None
+    matched = [n for n in list_services() if q is None or q in n]
+    for n in matched:
+        print(n)
+    if q is not None:
+        print(f"# {len(matched)} match(es) for {args.query!r}", file=sys.stderr)
+
+
 def report_parse(svc, sub, full, skipped):
     print(f"# {svc}: {len(sub)} subdomain-match + {len(full)} exact domains", file=sys.stderr)
     for s in skipped:
@@ -379,10 +419,14 @@ def main():
     for c, h in [("add", "fetch service list(s) and install (or refresh) them"),
                  ("update", "re-fetch and refresh services (default: all from config)"),
                  ("remove", "remove service(s) from the router"),
-                 ("render", "print RouterOS commands for service(s) to stdout")]:
+                 ("render", "print RouterOS commands for service(s) to stdout"),
+                 ("domains", "print resolved domains for service(s) from GitHub to stdout")]:
         p = sp.add_parser(c, help=h)
         p.add_argument("services", nargs="*" if c == "update" else "+",
                        help="v2fly service name or raw URL")
+
+    p = sp.add_parser("search", help="list available v2fly service names from GitHub")
+    p.add_argument("query", nargs="?", help="substring to filter service names")
 
     p = sp.add_parser("list", help="show services installed on the router")
     p.add_argument("-v", "--verbose", action="store_true", help="also list domains")
@@ -393,7 +437,7 @@ def main():
         cfg["ssh"] = args.router
     if getattr(args, "gateway", None):
         cfg["gateway"] = args.gateway
-    if args.cmd != "render" and not cfg["ssh"] and not args.dry_run:
+    if args.cmd not in ("render", "domains", "search") and not cfg["ssh"] and not args.dry_run:
         raise SystemExit('no router: use -r "ssh <host>" or set "ssh:" in the config file')
 
     if args.cmd == "bootstrap":
@@ -408,6 +452,10 @@ def main():
         cmd_list(cfg, args)
     elif args.cmd == "render":
         cmd_render(cfg, args)
+    elif args.cmd == "domains":
+        cmd_domains(cfg, args)
+    elif args.cmd == "search":
+        cmd_search(cfg, args)
 
 
 if __name__ == "__main__":
