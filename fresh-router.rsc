@@ -115,9 +115,9 @@
 /ip firewall mangle add chain=output action=mark-routing connection-mark=to_vpn_mark new-routing-mark=to_vpn_table passthrough=no comment="mtvpn:route-out"
 /ip route add dst-address=0.0.0.0/0 gateway=192.168.89.2 routing-table=to_vpn_table check-gateway=ping comment="mtvpn:route"
 
-# DoH via VPN (DPI kills direct DoH to Google; loop-safe: prerouting mark is LAN-only)
-/ip firewall address-list add list=to_vpn_list address=8.8.8.8 comment=doh
-/ip firewall address-list add list=to_vpn_list address=8.8.4.4 comment=doh
+# NOTE: do NOT add 8.8.8.8/8.8.4.4 to to_vpn_list to force router DoH through the
+# VPN: the flaky container path caused intermittent wrong/mismatched DNS answers
+# and makes DNS depend on container boot order. Keep DoH direct.
 
 # container
 /container config set registry-url=https://registry-1.docker.io tmpdir=usb1/container-tmp layer-dir=usb1/container-tmp/layer

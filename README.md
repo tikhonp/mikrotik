@@ -105,8 +105,10 @@ are adopted (removed and re-added with the tag) instead of duplicated.
 `fresh-router.rsc` is a full bootstrap template for a factory-fresh MikroTik:
 bridges, DHCP (configurable LAN subnet), DoH DNS, firewall, NAT, the mihomo
 container, the VPN routing infra (with mtvpn-compatible rule comments, so
-`bootstrap` is not needed), DoH-via-VPN, a container watchdog, and the
-Telegram IP-range updater script.
+`bootstrap` is not needed), a container watchdog, and the Telegram IP-range
+updater script. Router DoH goes direct to WAN on purpose: routing it through
+the VPN container caused intermittent wrong DNS answers and made DNS depend
+on the container being up.
 
 1. Edit the `PARAMETERS` section at the top (LAN subnet prefix, WAN port,
    subscription URL, timezone).
