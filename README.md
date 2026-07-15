@@ -43,6 +43,10 @@ Routing infra (created once by `bootstrap`, idempotent):
 - default route `0.0.0.0/0 → <gateway>` in `to_vpn_table` with
   `check-gateway=ping` — if the gateway dies, routing **fails open** to the
   main table (direct WAN) instead of blackholing
+- mangle `change-mss` (comment `mtvpn:mss-clamp`): TCP MSS on `to_vpn_mark`
+  connections is clamped to 1360, so tunnel encapsulation overhead (VLESS/Reality
+  shrinks the effective path MTU) can't stall full-size segments. Matching by
+  connection-mark clamps both the SYN and SYN-ACK, covering both directions.
 - `--fix-fasttrack` adds `connection-mark=!to_vpn_mark` to existing fasttrack
   rules (fasttrack would otherwise bypass mangle for established connections
   and leak them to direct WAN). Verify with
@@ -110,8 +114,11 @@ updater script. Router DoH goes direct to WAN on purpose: routing it through
 the VPN container caused intermittent wrong DNS answers and made DNS depend
 on the container being up.
 
-1. Edit the `PARAMETERS` section at the top (LAN subnet prefix, WAN port,
-   subscription URL, timezone).
+1. Edit the `PARAMETERS` section at the top: LAN subnet prefix, WAN port,
+   subscription URL, timezone, interface names, container subnet, and the
+   selective-VPN names (`vpnList` / `vpnTable` / `vpnMark`) — keep those three
+   equal to `list:` / `table:` / `mark:` in this router's `mtvpn` config, or
+   `add`/`update` won't line up with the rules this template creates.
 2. Do the one-time `PREREQUISITES` listed in the file header (reset config,
    install the container package, enable device-mode container, format the
    USB disk, import your SSH key).

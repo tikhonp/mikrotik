@@ -222,6 +222,13 @@ def rsc_bootstrap(cfg, fix_fasttrack=False):
         once(f'/ip firewall mangle find comment="mtvpn:route-out"',
              f'/ip firewall mangle add chain=output action=mark-routing '
              f'connection-mark={M} new-routing-mark={T} passthrough=no comment="mtvpn:route-out"'),
+        # clamp TCP MSS on tunneled flows: VLESS/Reality encapsulation shrinks the
+        # path MTU, so unclamped full-size segments stall. Match by connection-mark
+        # (rides every packet) to clamp both the SYN and SYN-ACK -> both directions.
+        once(f'/ip firewall mangle find comment="mtvpn:mss-clamp"',
+             f'/ip firewall mangle add chain=forward action=change-mss '
+             f'new-mss=1360 passthrough=yes protocol=tcp tcp-flags=syn '
+             f'connection-mark={M} tcp-mss=1361-65535 comment="mtvpn:mss-clamp"'),
         # default route via the gateway; check-gateway=ping -> fail-open to main
         # table (direct WAN) when the gateway is down
         once(f'/ip route find where routing-table={T} comment="mtvpn:route"',

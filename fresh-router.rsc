@@ -40,28 +40,51 @@
 :local image "registry-1.docker.io/wiktorbgu/mihomo-mikrotik:latest"
 :local timeZone "Europe/Moscow"
 
+# interface names
+:local lanIface "LAN"
+:local containerIface "container"
+:local vethName "vless"
+
+# selective-VPN routing names — MUST match this router's mtvpn <config>.yaml
+# (list: / table: / mark:) or mtvpn add/update/remove won't line up with the
+# rules created below. NOTE: mtvpn's lan_list: is an interface *list*, but this
+# template marks on the LAN *bridge* (in-interface=$lanIface). If you ever run
+# `mtvpn bootstrap` against this router, first create an interface-list holding
+# $lanIface, or bootstrap's prerouting rules will fail to add.
+:local vpnList "to_vpn_list"
+:local vpnTable "to_vpn_table"
+:local vpnMark "to_vpn_mark"
+
+# container internal /24: router side = .1, mihomo veth = .2 = the VPN gateway
+:local containerNet "192.168.89"
+:local vpnGateway ($containerNet . ".2")
+
 # bridges & ports
-/interface bridge add name=LAN
-/interface bridge add name=container
+/interface bridge add name=$lanIface
+/interface bridge add name=$containerIface
 :foreach e in=[/interface ethernet find where name!=$wanIface] do={
-    /interface bridge port add bridge=LAN interface=[/interface ethernet get $e name]
+    /interface bridge port add bridge=$lanIface interface=[/interface ethernet get $e name]
 }
 
-# container veth (fixed internal subnet 192.168.89.0/24)
-/interface veth add name=vless address=192.168.89.2/24 gateway=192.168.89.1
-/interface bridge port add bridge=container interface=vless
+# container veth (internal subnet $containerNet.0/24; veth .2 = VPN gateway)
+/interface veth add name=$vethName address=($containerNet . ".2/24") gateway=($containerNet . ".1")
+/interface bridge port add bridge=$containerIface interface=$vethName
 
 # addressing / DHCP
-/ip address add address=($lanNet . ".1/24") interface=LAN
-/ip address add address=192.168.89.1/24 interface=container
+/ip address add address=($lanNet . ".1/24") interface=$lanIface
+/ip address add address=($containerNet . ".1/24") interface=$containerIface
 /ip pool add name=dhcp_pool ranges=($lanNet . ".20-" . $lanNet . ".254")
-/ip dhcp-server add address-pool=dhcp_pool interface=LAN name=dhcp1 disabled=no
+/ip dhcp-server add address-pool=dhcp_pool interface=$lanIface name=dhcp1 disabled=no
 /ip dhcp-server network add address=($lanNet . ".0/24") gateway=($lanNet . ".1") dns-server=($lanNet . ".1")
 /ip dhcp-client add interface=$wanIface use-peer-dns=no disabled=no
 
 # DNS: DoH to dns.google (bootstrapped by static A records)
 /ip dns static add address=8.8.8.8 name=dns.google type=A
 /ip dns static add address=8.8.4.4 name=dns.google type=A
+# NOTE: verify-doh-cert=yes validates against the built-in trust store, which is
+# enabled by default on RouterOS 7.x (/certificate settings builtin-trust-store=default,
+# verified on 7.23.2). No manual trust step is needed — the gist's
+# builtin-trust-anchors= property does not exist on 7.2x and would error on import.
 /ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=300 doh-max-server-connections=100 doh-timeout=10s
 
 # firewall address lists
@@ -94,7 +117,7 @@
 /ip firewall filter add action=drop chain=forward comment="Drop incoming packets that are not NAT`ted" connection-nat-state=!dstnat connection-state=new in-interface=$wanIface log=yes log-prefix=!NAT
 /ip firewall filter add action=jump chain=forward comment="jump to ICMP filters" jump-target=icmp protocol=icmp
 /ip firewall filter add action=drop chain=forward comment="Drop incoming from internet which is not public IP" in-interface=$wanIface log=yes log-prefix=!public src-address-list=not_in_internet
-/ip firewall filter add action=drop chain=forward comment="Drop packets from LAN that do not have LAN IP" in-interface=LAN log=yes log-prefix=LAN_!LAN src-address-list=!lan_nets
+/ip firewall filter add action=drop chain=forward comment="Drop packets from LAN that do not have LAN IP" in-interface=$lanIface log=yes log-prefix=LAN_!LAN src-address-list=!lan_nets
 /ip firewall filter add action=accept chain=icmp comment="echo reply" icmp-options=0:0 protocol=icmp
 /ip firewall filter add action=accept chain=icmp comment="net unreachable" icmp-options=3:0 protocol=icmp
 /ip firewall filter add action=accept chain=icmp comment="host unreachable" icmp-options=3:1 protocol=icmp
@@ -108,12 +131,17 @@
 /ip firewall nat add action=masquerade chain=srcnat comment="Masquerade LAN -> WAN" out-interface=$wanIface
 
 # selective-VPN routing infrastructure (mtvpn-compatible comments)
-/routing table add name=to_vpn_table fib
-/ip firewall mangle add chain=prerouting action=mark-connection connection-mark=no-mark dst-address-list=to_vpn_list in-interface=LAN new-connection-mark=to_vpn_mark passthrough=yes comment="mtvpn:conn-lan"
-/ip firewall mangle add chain=output action=mark-connection connection-mark=no-mark dst-address-list=to_vpn_list new-connection-mark=to_vpn_mark passthrough=yes comment="mtvpn:conn-out"
-/ip firewall mangle add chain=prerouting action=mark-routing connection-mark=to_vpn_mark in-interface=LAN new-routing-mark=to_vpn_table passthrough=no comment="mtvpn:route-pre"
-/ip firewall mangle add chain=output action=mark-routing connection-mark=to_vpn_mark new-routing-mark=to_vpn_table passthrough=no comment="mtvpn:route-out"
-/ip route add dst-address=0.0.0.0/0 gateway=192.168.89.2 routing-table=to_vpn_table check-gateway=ping comment="mtvpn:route"
+/routing table add name=$vpnTable fib
+/ip firewall mangle add chain=prerouting action=mark-connection connection-mark=no-mark dst-address-list=$vpnList in-interface=$lanIface new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-lan"
+/ip firewall mangle add chain=output action=mark-connection connection-mark=no-mark dst-address-list=$vpnList new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-out"
+/ip firewall mangle add chain=prerouting action=mark-routing connection-mark=$vpnMark in-interface=$lanIface new-routing-mark=$vpnTable passthrough=no comment="mtvpn:route-pre"
+/ip firewall mangle add chain=output action=mark-routing connection-mark=$vpnMark new-routing-mark=$vpnTable passthrough=no comment="mtvpn:route-out"
+# clamp TCP MSS on tunneled flows: VLESS/Reality encapsulation shrinks the path
+# MTU, so unclamped full-size segments stall ("some sites hang over VPN"). Match
+# by connection-mark (rides every packet) so both the SYN and SYN-ACK are clamped
+# -> both directions covered, no dependence on the container interface name.
+/ip firewall mangle add chain=forward action=change-mss new-mss=1360 passthrough=yes protocol=tcp tcp-flags=syn connection-mark=$vpnMark tcp-mss=1361-65535 comment="mtvpn:mss-clamp"
+/ip route add dst-address=0.0.0.0/0 gateway=$vpnGateway routing-table=$vpnTable check-gateway=ping comment="mtvpn:route"
 
 # NOTE: do NOT add 8.8.8.8/8.8.4.4 to to_vpn_list to force router DoH through the
 # VPN: the flaky container path caused intermittent wrong/mismatched DNS answers
@@ -122,10 +150,10 @@
 # container
 /container config set registry-url=https://registry-1.docker.io tmpdir=usb1/container-tmp layer-dir=usb1/container-tmp/layer
 /container envs add key=SUB1 list=mihomo value=$subUrl
-/container add remote-image=$image interface=vless envlists=mihomo dns=8.8.8.8,8.8.4.4 root-dir=usb1/container-tmp/docker/mihomo start-on-boot=yes
+/container add remote-image=$image interface=$vethName envlists=mihomo dns=8.8.8.8,8.8.4.4 root-dir=usb1/container-tmp/docker/mihomo start-on-boot=yes
 
 # container watchdog: restart mihomo if its IP stops answering
-/tool netwatch add host=192.168.89.2 interval=1m timeout=2s type=simple down-script="/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted\""
+/tool netwatch add host=$vpnGateway interval=1m timeout=2s type=simple down-script="/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted\""
 
 # system
 /system clock set time-zone-name=$timeZone
@@ -144,16 +172,16 @@
 /system scheduler add interval=6h name=Update_Telegram_IPs on-event="/system script run Update_Telegram_CIDR" policy=read,write,policy,test start-time=03:15:00
 /system script
 add dont-require-permissions=no name=Update_Telegram_CIDR owner=tikhon \
-    policy=read,write,policy,test source="\
+    policy=read,write,policy,test source=("\
     \n#  Update_Telegram_CIDR  -  fail-safe rewrite\
     \n#  Refreshes Telegram IPv4 CIDRs in to_vpn_list.\
     \n#  Never empties the list on failure. Always cleans up.\
     \n\
     \n:local url         \"https://core.telegram.org/resources/cidr.txt\"\
     \n:local resolveHost \"core.telegram.org\"\
-    \n:local listName    \"to_vpn_list\"\
+    \n:local listName    \"" . $vpnList . "\"\
     \n:local tag         \"telegram\"\
-    \n:local altGateway  \"192.168.89.2\"\
+    \n:local altGateway  \"" . $vpnGateway . "\"\
     \n:local routeTag    \"TEMP_TG_FETCH\"\
     \n:local minEntries  5\
     \n\
@@ -256,4 +284,4 @@ add dont-require-permissions=no name=Update_Telegram_CIDR owner=tikhon \
     \n\
     \n# 5. cleanup - always reached\
     \n/ip route remove [find comment=\$routeTag]\
-    \n:log info \"TG CIDR: finished\""
+    \n:log info \"TG CIDR: finished\"")
