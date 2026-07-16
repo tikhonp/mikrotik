@@ -89,12 +89,7 @@ def load_config(path):
     cfg = dict(DEFAULTS)
     p = Path(path)
     if p.exists():
-        text = p.read_text()
-        try:  # legacy JSON configs still load; saving writes YAML
-            loaded = json.loads(text)
-        except ValueError:
-            loaded = parse_yaml(text)
-        cfg.update(loaded)
+        cfg.update(parse_yaml(p.read_text()))
     if not cfg.get("ssh") and cfg.get("router"):  # legacy router/ssh_opts keys
         cfg["ssh"] = " ".join(["ssh"] + cfg.pop("ssh_opts", []) + [cfg.pop("router")])
     if isinstance(cfg.get("services"), str):  # empty "services:" line parses as ""

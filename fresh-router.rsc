@@ -1,26 +1,23 @@
 # fresh-router.rsc — bootstrap a fresh MikroTik with selective-VPN routing
 #
-# Replicates the proven hEX S / RB3011 design: domains in address-list
-# to_vpn_list are routed through a mihomo container (VLESS), everything else
-# goes direct. Fail-open: if the container dies, VPN-listed traffic falls
-# back to direct WAN (check-gateway=ping).
-#
 # USAGE
 #   1. Edit the variables in the PARAMETERS section below.
 #   2. Complete the PREREQUISITES (manual, once per device).
 #   3. Upload this file and run:  /import fresh-router.rsc
 #   4. From your workstation, add domain services:
-#        ./mtvpn.py -c <router-config>.json add anthropic openai youtube ...
+#        ./mtvpn.py -c <router-config>.yaml add anthropic openai youtube ...
 #
 # PREREQUISITES (before import)
 #   - Clean config:      /system reset-configuration no-defaults=yes skip-backup=yes
-#   - Container package: install container-<ver>-<arch>.npk (zip from mikrotik.com), reboot
 #   - Enable containers: /system/device-mode/update container=yes
 #                        (requires power-button press or reboot to confirm)
 #   - USB disk:          plug in, then  /disk format-drive usb1 file-system=ext4
 #                        (adjust slot name if not usb1)
 #   - SSH key:           /user ssh-keys import public-key-file=<your-key>.pub user=admin
 #                        (then disable password-authentication)
+#                        after confirming SSH key login works, also run:
+#                        /ip ssh set password-authentication=no
+#   - Copy files:        scp <your-key>.pub <config-fresh-router>.rsc admin@<router-ip>:
 #
 # AFTER IMPORT
 #   - The container image is pulled automatically; netwatch starts it once
@@ -83,8 +80,7 @@
 /ip dns static add address=8.8.4.4 name=dns.google type=A
 # NOTE: verify-doh-cert=yes validates against the built-in trust store, which is
 # enabled by default on RouterOS 7.x (/certificate settings builtin-trust-store=default,
-# verified on 7.23.2). No manual trust step is needed — the gist's
-# builtin-trust-anchors= property does not exist on 7.2x and would error on import.
+# verified on 7.23.2)
 /ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=300 doh-max-server-connections=100 doh-timeout=10s
 
 # firewall address lists
@@ -143,10 +139,6 @@
 /ip firewall mangle add chain=forward action=change-mss new-mss=1360 passthrough=yes protocol=tcp tcp-flags=syn connection-mark=$vpnMark tcp-mss=1361-65535 comment="mtvpn:mss-clamp"
 /ip route add dst-address=0.0.0.0/0 gateway=$vpnGateway routing-table=$vpnTable check-gateway=ping comment="mtvpn:route"
 
-# NOTE: do NOT add 8.8.8.8/8.8.4.4 to to_vpn_list to force router DoH through the
-# VPN: the flaky container path caused intermittent wrong/mismatched DNS answers
-# and makes DNS depend on container boot order. Keep DoH direct.
-
 # container
 /container config set registry-url=https://registry-1.docker.io tmpdir=usb1/container-tmp layer-dir=usb1/container-tmp/layer
 /container envs add key=SUB1 list=mihomo value=$subUrl
@@ -165,8 +157,6 @@
 /ip service set www disabled=yes
 /ip service set api disabled=yes
 /ip service set api-ssl disabled=yes
-# after confirming SSH key login works, also run:
-#   /ip ssh set password-authentication=no
 
 # Telegram IP ranges updater (domain lists don't cover TG's raw-IP clients)
 /system scheduler add interval=6h name=Update_Telegram_IPs on-event="/system script run Update_Telegram_CIDR" policy=read,write,policy,test start-time=03:15:00
