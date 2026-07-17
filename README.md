@@ -46,6 +46,9 @@ never commit router addresses or subscription URLs):
 ```yaml
 # full ssh command for reaching the router; anything ssh accepts
 ssh: ssh -J jumphost 10.230.1.1
+# optional: override the scp command derived from ssh: for the /import fast
+# path (leave empty to auto-derive). {local}/{remote} are substituted.
+# scp: scp -J jumphost {local} 10.230.1.1:{remote}
 # next-hop IP of the VPN gateway (container veth / tunnel peer)
 gateway: 192.168.89.2
 list: to_vpn_list
@@ -88,6 +91,18 @@ services:
 `add`/`update` are idempotent: entries tagged with the service comment are
 replaced wholesale, and pre-existing *untagged* entries for the same domains are
 adopted rather than duplicated.
+
+### How commands reach the router
+
+By default commands are delivered by the **fast path**: the service is rendered
+as a single `{ ... }` RouterOS script block, `scp`'d to the router, and run with
+`/import` — one script scope, no interactive-console round-trips, and O(N)
+adoption, so it is much faster for large lists. The scp command is derived from
+`ssh:` (jump hosts, `-i`, ports handled); set `scp:` to override. If the `scp`
+binary is missing the tool falls back to piping a **per-line** form over the ssh
+stdin (the interactive console evaluates each line independently, so this form
+avoids the block; it is O(N²) but only used when scp is unavailable). `-n` /
+`render` never contact the router.
 
 Re-run `update` when upstream lists change, or cron it on the machine with SSH
 access:

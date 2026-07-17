@@ -19,10 +19,12 @@ Requires: python3 (stdlib only) and ssh key auth to the router.
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -32,6 +34,8 @@ V2FLY_TREE_API = "https://api.github.com/repos/v2fly/domain-list-community/git/t
 
 DEFAULTS = {
     "ssh": "",                # full ssh command, e.g. "ssh -J jumphost 10.0.0.1"
+    "scp": "",                # optional scp template override with {local}/{remote}
+                              # placeholders; derived from ssh when empty
     "gateway": "",            # next-hop IP of the VPN gateway (container/tunnel peer)
     "list": "to_vpn_list",
     "table": "to_vpn_table",
@@ -157,25 +161,69 @@ def parse_list(url, seen=None):
     return sub, full, skipped
 
 
-def rsc_service(svc, sub, full, cfg):
+def rsc_service(svc, sub, full, cfg, single_scope=True):
     """RouterOS commands that install/refresh one service's domains, idempotently.
 
     Entries are tagged comment=<svc>. Untagged duplicates (manual entries for the
     same domain) are adopted: removed first, re-added with the tag.
+
+    Two forms, because the two transports parse differently:
+
+    - single_scope=True (default; `/import` fast path and `render`): one `{ ... }`
+      block that runs in a single scope, so adoption is O(N) — the domains are
+      loaded into a keyed array once and each list is swept a single time with
+      O(1) lookups, instead of an O(table) `[find]` per domain.
+    - single_scope=False (stdin-pipe fallback): the interactive console evaluates
+      each piped line independently (no cross-line scope, and a ~1600-statement
+      single-line cap), so we fall back to self-contained per-domain lines. That
+      is O(N^2) on the router but only runs when `scp` is unavailable.
     """
     L = cfg["list"]
+    # A domain can be in both lists (v2fly `domain:` + `full:` for the same name,
+    # e.g. itunes.apple.com). Each name must be added once or the second add
+    # fails "entry already exists"; match-subdomain=yes is the superset, so it
+    # wins over an exact duplicate.
+    domains = [(d, "yes") for d in sorted(sub)] + [(d, "no") for d in sorted(full - sub)]
+    if not single_scope:
+        out = [
+            f'/ip dns static remove [find comment="{svc}" address-list="{L}"]',
+            f'/ip firewall address-list remove [find list="{L}" comment="{svc}" dynamic=no]',
+        ]
+        for domain, match_sub in domains:
+            out += [
+                f':do {{/ip dns static remove [find name="{domain}" type=FWD address-list="{L}"]}} on-error={{}}',
+                f'/ip dns static add name={domain} type=FWD match-subdomain={match_sub} '
+                f'address-list={L} comment="{svc}"',
+                f':do {{/ip firewall address-list remove [find list="{L}" address="{domain}" dynamic=no]}} on-error={{}}',
+                f':do {{/ip firewall address-list add list={L} address={domain} comment="{svc}"}} on-error={{}}',
+            ]
+        return out
     out = [
+        "{",
         f'/ip dns static remove [find comment="{svc}" address-list="{L}"]',
         f'/ip firewall address-list remove [find list="{L}" comment="{svc}" dynamic=no]',
+        ':local ours [:toarray ""]',
     ]
-    for domain, match_sub in [(d, "yes") for d in sorted(sub)] + [(d, "no") for d in sorted(full)]:
+    # Short per-line :set statements (not one mega array literal) so the block
+    # also survives the interactive-console fallback, which caps line length.
+    out += [f':set ($ours->"{domain}") 1' for domain, _ in domains]
+    # Adopt untagged duplicates: sweep each list once, remove entries whose
+    # name/address is one of ours (same reach as the old per-domain removes).
+    out += [
+        f':foreach e in=[/ip dns static find where address-list="{L}" type=FWD] '
+        f'do={{:if ([:typeof ($ours->[/ip dns static get $e name])]!="nothing") '
+        f'do={{/ip dns static remove $e}}}}',
+        f':foreach e in=[/ip firewall address-list find where list="{L}" dynamic=no] '
+        f'do={{:if ([:typeof ($ours->[/ip firewall address-list get $e address])]!="nothing") '
+        f'do={{/ip firewall address-list remove $e}}}}',
+    ]
+    for domain, match_sub in domains:
         out += [
-            f':do {{/ip dns static remove [find name="{domain}" type=FWD address-list="{L}"]}} on-error={{}}',
             f'/ip dns static add name={domain} type=FWD match-subdomain={match_sub} '
             f'address-list={L} comment="{svc}"',
-            f':do {{/ip firewall address-list remove [find list="{L}" address="{domain}" dynamic=no]}} on-error={{}}',
             f':do {{/ip firewall address-list add list={L} address={domain} comment="{svc}"}} on-error={{}}',
         ]
+    out.append("}")
     return out
 
 
@@ -250,25 +298,115 @@ def ssh_base(cfg):
     return [cmd[0], "-o", "BatchMode=yes"] + cmd[1:]
 
 
+def scp_base(cfg, local, remote):
+    """scp argv to copy `local` to the router as `remote`.
+
+    Either derived from cfg["ssh"] (swap the program to scp, keep pass-through
+    options, map ssh's -p PORT to scp's -P PORT, turn the host token into
+    host:remote) or, if cfg["scp"] is set, taken from that template with the
+    {local}/{remote} placeholders substituted — an escape hatch for topologies
+    the derivation gets wrong.
+    """
+    if cfg.get("scp"):
+        return [t.replace("{local}", local).replace("{remote}", remote)
+                for t in shlex.split(cfg["scp"])]
+    toks = shlex.split(cfg["ssh"])
+    if toks and toks[0] == "ssh":
+        toks = toks[1:]
+    if not toks:
+        raise SystemExit('no ssh target: set "ssh:" in the config or pass -r "ssh <host>"')
+    host, opts, mapped, i = toks[-1], toks[:-1], [], 0
+    while i < len(opts):
+        if opts[i] == "-p" and i + 1 < len(opts):  # ssh -p PORT -> scp -P PORT
+            mapped += ["-P", opts[i + 1]]
+            i += 2
+        else:
+            mapped.append(opts[i])
+            i += 1
+    return ["scp", "-o", "BatchMode=yes"] + mapped + [local, f"{host}:{remote}"]
+
+
+def can_scp(cfg):
+    """Whether the /import fast path is usable: some ssh/scp target resolves."""
+    return bool(cfg.get("scp") or cfg.get("ssh"))
+
+
 def target(cfg):
     """Short display name for the router: last token of the ssh command."""
     return cfg["ssh"].split()[-1] if cfg["ssh"] else "(dry-run)"
 
 
-def push(cfg, script, dry_run=False):
-    text = "\n".join(script) + "\n"
+# /import can exit 0 even when a line failed; scan its output for these too.
+IMPORT_ERROR = re.compile(
+    r"syntax error|failure|expected|no such item|does not match|bad command|invalid", re.I)
+
+
+def push(cfg, script, dry_run=False, pipe_script=None):
+    """Apply `script` to the router.
+
+    `script` is the single-scope form for the `/import` fast path. `pipe_script`,
+    if given, is the per-line form used for the stdin fallback (see rsc_service);
+    when omitted the script is self-contained enough to pipe as-is.
+    """
     if dry_run:
-        print(text, end="")
+        print("\n".join(script) + "\n", end="")
         return
+    if can_scp(cfg):
+        try:
+            _push_import(cfg, "\n".join(script) + "\n")
+            return
+        except FileNotFoundError:  # scp binary missing -> fall back to the pipe
+            print("  scp not found; falling back to the stdin pipe (slower)")
+    _push_stdin(cfg, "\n".join(pipe_script or script) + "\n")
+
+
+def _report(lines):
+    for l in lines:
+        if not SSH_NOISE.search(l):
+            print("  router:", l)
+
+
+def _push_stdin(cfg, text):
+    """Fallback transport: pipe the script into the interactive console."""
     r = subprocess.run(
         ssh_base(cfg),
         input=text, capture_output=True, text=True, timeout=300,
     )
-    noise_free = [l for l in (r.stdout + r.stderr).splitlines() if not SSH_NOISE.search(l)]
-    for l in noise_free:
-        print("  router:", l)
+    _report((r.stdout + r.stderr).splitlines())
     if r.returncode != 0:
         raise SystemExit(f"ssh to {target(cfg)} failed (exit {r.returncode})")
+
+
+def _push_import(cfg, text):
+    """Fast transport: scp the script to the router and run it with /import."""
+    remote = "mtvpn-import.rsc"
+    fd, local = tempfile.mkstemp(suffix=".rsc")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        s = subprocess.run(scp_base(cfg, local, remote),
+                           capture_output=True, text=True, timeout=300)
+        if s.returncode != 0:
+            _report((s.stdout + s.stderr).splitlines())
+            raise SystemExit(f"scp to {target(cfg)} failed (exit {s.returncode})")
+        try:
+            r = subprocess.run(
+                ssh_base(cfg) + [f"/import file-name={remote} verbose=no"],
+                capture_output=True, text=True, timeout=300,
+            )
+            out = (r.stdout + r.stderr).splitlines()
+            _report(out)
+            noise_free = [l for l in out if not SSH_NOISE.search(l)]
+            if r.returncode != 0 or any(IMPORT_ERROR.search(l) for l in noise_free):
+                raise SystemExit(f"/import on {target(cfg)} failed")
+        finally:
+            # Best-effort router cleanup, even if the import errored out.
+            subprocess.run(
+                ssh_base(cfg) + [f':do {{/file remove [find name="{remote}"]}} on-error={{}}'],
+                capture_output=True, text=True, timeout=120,
+            )
+    finally:
+        os.unlink(local)
 
 
 def query(cfg, command):
@@ -280,13 +418,17 @@ def query(cfg, command):
 
 
 def cmd_bootstrap(cfg, args):
-    script = rsc_bootstrap(cfg, fix_fasttrack=args.fix_fasttrack)
+    # Infra lines are self-contained, so they serve both transports; only the
+    # per-service blocks differ between the /import and stdin forms.
+    infra = rsc_bootstrap(cfg, fix_fasttrack=args.fix_fasttrack)
+    script, pipe_script = list(infra), list(infra)
     for name in cfg["services"]:
         svc, url = service_url(name)
         sub, full, skipped = parse_list(url)
         report_parse(svc, sub, full, skipped)
         script += rsc_service(svc, sub, full, cfg)
-    push(cfg, script, args.dry_run)
+        pipe_script += rsc_service(svc, sub, full, cfg, single_scope=False)
+    push(cfg, script, args.dry_run, pipe_script=pipe_script)
     if not args.dry_run:
         print(f"bootstrapped {target(cfg)}: infra + {len(cfg['services'])} service(s)")
         print("NOTE: LAN clients must use the router as their only DNS server "
@@ -299,7 +441,8 @@ def cmd_add(cfg, args, config_path):
         svc, url = service_url(name)
         sub, full, skipped = parse_list(url)
         report_parse(svc, sub, full, skipped)
-        push(cfg, rsc_service(svc, sub, full, cfg), args.dry_run)
+        push(cfg, rsc_service(svc, sub, full, cfg), args.dry_run,
+             pipe_script=rsc_service(svc, sub, full, cfg, single_scope=False))
         if not args.dry_run:
             print(f"added '{svc}' ({len(sub) + len(full)} domains) on {target(cfg)}")
         if not args.dry_run and Path(config_path).exists() and name not in cfg["services"]:
