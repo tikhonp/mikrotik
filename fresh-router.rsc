@@ -159,7 +159,10 @@
 /ip service set api-ssl disabled=yes
 
 # Telegram IP ranges updater (domain lists don't cover TG's raw-IP clients)
-/system scheduler add interval=6h name=Update_Telegram_IPs on-event="/system script run Update_Telegram_CIDR" policy=read,write,policy,test start-time=03:15:00
+# start-time=startup, not a wall-clock time: at import the RB3011 has no synced
+# clock yet (no battery RTC), so a fixed start-time pins start-date to the stale
+# pre-NTP date and next-run stays in the past forever -- the scheduler never fires.
+/system scheduler add interval=6h name=Update_Telegram_IPs on-event="/system script run Update_Telegram_CIDR" policy=read,write,policy,test start-time=startup
 /system script
 add dont-require-permissions=no name=Update_Telegram_CIDR owner=tikhon \
     policy=read,write,policy,test source=("\
@@ -170,7 +173,10 @@ add dont-require-permissions=no name=Update_Telegram_CIDR owner=tikhon \
     \n:local url         \"https://core.telegram.org/resources/cidr.txt\"\
     \n:local resolveHost \"core.telegram.org\"\
     \n:local listName    \"" . $vpnList . "\"\
-    \n:local tag         \"telegram\"\
+    \n# NOT \"telegram\": mtvpn tags its telegram service entries comment=telegram,\
+    \n# and step 4 below removes the whole tag before re-adding. A shared tag makes\
+    \n# the two wipe each other's entries.\
+    \n:local tag         \"telegram-cidr\"\
     \n:local altGateway  \"" . $vpnGateway . "\"\
     \n:local routeTag    \"TEMP_TG_FETCH\"\
     \n:local minEntries  5\
