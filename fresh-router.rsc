@@ -17,6 +17,8 @@
 #                        (then disable password-authentication)
 #                        after confirming SSH key login works, also run:
 #                        /ip ssh set password-authentication=no
+#   - Disable admin:     /user disable admin
+#                        (after confirming your own user can log in)
 #   - Copy files:        scp <your-key>.pub <config-fresh-router>.rsc admin@<router-ip>:
 #
 # AFTER IMPORT
@@ -25,6 +27,9 @@
 #   - Verify VPN egress:  /tool fetch url=https://ifconfig.me/ip output=user
 #     (ifconfig.me must first be added to the list, e.g. via mtvpn or manually)
 #   - Once SSH key login works, harden:  /ip ssh set password-authentication=no
+#   - Reboot once: the IPv6 disable below only takes effect on restart.
+#   - `mtvpn bootstrap` is compatible with this router (it finds every mtvpn:*
+#     rule below and adds nothing) *provided* the config sets lan_list: LANiface.
 
 # PARAMETERS
 # LAN /24 prefix (no trailing dot). Router gets .1, DHCP hands out .20-.254
@@ -42,12 +47,21 @@
 :local containerIface "container"
 :local vethName "vless"
 
+# interface *lists*. Every firewall/mangle rule below matches on these rather
+# than on interface names, so a second LAN segment or WAN uplink is a one-line
+# membership change. Named distinctly from the bridges on purpose: RouterOS does
+# not document whether a list may share a name with an interface, and a rejected
+# /interface list add would abort the whole import.
+:local lanList "LANiface"
+:local wanList "WANiface"
+
 # selective-VPN routing names — MUST match this router's mtvpn <config>.yaml
-# (list: / table: / mark:) or mtvpn add/update/remove won't line up with the
-# rules created below. NOTE: mtvpn's lan_list: is an interface *list*, but this
-# template marks on the LAN *bridge* (in-interface=$lanIface). If you ever run
-# `mtvpn bootstrap` against this router, first create an interface-list holding
-# $lanIface, or bootstrap's prerouting rules will fail to add.
+# (list: / table: / mark: / lan_list:) or mtvpn add/update/remove won't line up
+# with the rules created below. In particular set
+#     lan_list: LANiface
+# in that config: mtvpn's built-in default is "LAN", which on this router is the
+# *bridge*, not a list, so `mtvpn bootstrap` would emit in-interface-list=LAN
+# and fail to add its prerouting rules.
 :local vpnList "to_vpn_list"
 :local vpnTable "to_vpn_table"
 :local vpnMark "to_vpn_mark"
@@ -62,6 +76,25 @@
 :foreach e in=[/interface ethernet find where name!=$wanIface] do={
     /interface bridge port add bridge=$lanIface interface=[/interface ethernet get $e name]
 }
+
+# Pin the bridge MAC to the first LAN port. With auto-mac=yes (the default) the
+# bridge borrows the MAC of the lowest-numbered *running* port, so it changes
+# whenever ports go up or down and LAN clients have to re-ARP their gateway.
+:local lanPorts [/interface ethernet find where name!=$wanIface]
+:if ([:len $lanPorts] > 0) do={
+    /interface bridge set [find name=$lanIface] auto-mac=no admin-mac=[/interface ethernet get [:pick $lanPorts 0] mac-address]
+}
+
+# interface lists. The *bridge* is the member, not its ports: for routed traffic
+# the IP firewall sees the bridge as in-interface, so listing the ports instead
+# would match nothing.
+/interface list add name=$lanList
+/interface list add name=$wanList
+/interface list member add list=$lanList interface=$lanIface
+/interface list member add list=$wanList interface=$wanIface
+# The container bridge is deliberately in neither list: mihomo then cannot reach
+# router services (the input chain drops anything not from LAN), and its egress
+# is never mistaken for LAN traffic by the VPN mangle rules below.
 
 # container veth (internal subnet $containerNet.0/24; veth .2 = VPN gateway)
 /interface veth add name=$vethName address=($containerNet . ".2/24") gateway=($containerNet . ".1")
@@ -78,10 +111,10 @@
 # DNS: DoH to dns.google (bootstrapped by static A records)
 /ip dns static add address=8.8.8.8 name=dns.google type=A
 /ip dns static add address=8.8.4.4 name=dns.google type=A
-# NOTE: verify-doh-cert=yes validates against the built-in trust store, which is
-# enabled by default on RouterOS 7.x (/certificate settings builtin-trust-store=default,
-# verified on 7.23.2)
-/ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=300 doh-max-server-connections=100 doh-timeout=10s
+# plain A record, no address-list= -> mtvpn never touches it (it only ever
+# finds/removes /ip dns static entries that carry address-list=)
+/ip dns static add address=($lanNet . ".1") name=router.lan type=A
+/ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=100 doh-max-server-connections=20 doh-timeout=10s cache-size=16384KiB
 
 # firewall address lists
 /ip firewall address-list add list=lan_nets address=($lanNet . ".0/24")
@@ -102,35 +135,67 @@
 /ip firewall address-list add address=240.0.0.0/4 comment=RFC6890 list=not_in_internet
 /ip firewall address-list add address=192.88.99.0/24 comment="6to4 relay Anycast [RFC 3068]" list=not_in_internet
 
+# No /ip firewall raw rules on purpose. MikroTik's "Building Advanced Firewall"
+# puts a bad_tcp flag-validation chain here, but raw sits ahead of connection
+# tracking in the packet flow, so every rule in it is evaluated on every packet
+# — including FastTracked ones, which bypass the filter chain but not raw. That
+# put ~9 evaluations per TCP packet on the hot path to block malformed-flag
+# scans that the input default-deny and the forward !dstnat rule already drop.
+# To measure before re-adding: /ip firewall raw print stats during a large
+# download — if a raw rule's counter climbs at line rate, raw is on the fast path.
+
 # firewall filter
-/ip firewall filter add action=accept chain=input comment="established, related" connection-state=established,related
-/ip firewall filter add action=accept chain=input src-address-list=allowed_to_router
-/ip firewall filter add action=accept chain=input protocol=icmp
-/ip firewall filter add action=drop chain=input in-interface=$wanIface comment="drop all other WAN input"
+# input is default-deny: the filter policy is accept, so without the final drop
+# anything that is not explicitly matched reaches the router — the container
+# bridge today, any tunnel or VLAN added later. A new WireGuard/Tailscale
+# interface must join $lanList (or get its own accept) or its input is dropped.
+/ip firewall filter add action=accept chain=input comment="established, related, untracked" connection-state=established,related,untracked
+/ip firewall filter add action=drop chain=input comment="drop invalid" connection-state=invalid
+# in-interface-list= as well as src-address-list=: without it a WAN packet
+# spoofing a LAN source address would be accepted by the router.
+/ip firewall filter add action=accept chain=input comment="trusted LAN sources" in-interface-list=$lanList src-address-list=allowed_to_router
+# No DHCP accept rule is needed here even though a DISCOVER has src 0.0.0.0 and
+# therefore misses allowed_to_router above: RouterOS handles DHCP before the
+# filter chain. Measured on a live hEX S — an explicit accept rule sat at 0
+# packets while 13 clients renewed 30-minute leases, so DHCP never reaches this
+# chain at all. (The stock MikroTik config is the other half of the proof: it
+# drops the WAN interface outright yet its DHCP client still gets a lease.)
+# rate-limited: this rule (not the icmp chain below) is what answers pings to the
+# router itself. LAN pings never reach it — they are already accepted by the rule
+# above — so the limit only throttles ICMP arriving from elsewhere, and
+# over-limit packets fall through to the default deny.
+/ip firewall filter add action=accept chain=input comment="allow ping to the router" limit=5,10:packet protocol=icmp
+/ip firewall filter add action=drop chain=input comment="default deny: anything not accepted above"
 /ip firewall filter add action=fasttrack-connection chain=forward comment="FastTrack (skips VPN-marked)" connection-mark=no-mark connection-state=established,related
-/ip firewall filter add action=accept chain=forward comment="Established, Related" connection-state=established,related
-/ip firewall filter add action=drop chain=forward comment="Drop invalid" connection-state=invalid log=yes log-prefix=invalid
-/ip firewall filter add action=drop chain=forward comment="Drop incoming packets that are not NAT`ted" connection-nat-state=!dstnat connection-state=new in-interface=$wanIface log=yes log-prefix=!NAT
+/ip firewall filter add action=accept chain=forward comment="Established, Related, Untracked" connection-state=established,related,untracked
+# These four drops deliberately do NOT log. "invalid" and "!NAT" fire constantly
+# from background internet scanning, and a log write per dropped packet turns a
+# scan into a self-inflicted CPU load — the more junk arrives, the more work the
+# router does. Add log=yes log-prefix=<x> back temporarily when debugging.
+/ip firewall filter add action=drop chain=forward comment="Drop invalid" connection-state=invalid
+/ip firewall filter add action=drop chain=forward comment="Drop incoming packets that are not NAT`ted" connection-nat-state=!dstnat connection-state=new in-interface-list=$wanList
 /ip firewall filter add action=jump chain=forward comment="jump to ICMP filters" jump-target=icmp protocol=icmp
-/ip firewall filter add action=drop chain=forward comment="Drop incoming from internet which is not public IP" in-interface=$wanIface log=yes log-prefix=!public src-address-list=not_in_internet
-/ip firewall filter add action=drop chain=forward comment="Drop packets from LAN that do not have LAN IP" in-interface=$lanIface log=yes log-prefix=LAN_!LAN src-address-list=!lan_nets
-/ip firewall filter add action=accept chain=icmp comment="echo reply" icmp-options=0:0 protocol=icmp
+/ip firewall filter add action=drop chain=forward comment="Drop incoming from internet which is not public IP" in-interface-list=$wanList src-address-list=not_in_internet
+/ip firewall filter add action=drop chain=forward comment="Drop packets from LAN that do not have LAN IP" in-interface-list=$lanList src-address-list=!lan_nets
+# forwarded ICMP only (reached via the jump above). Echo request/reply are
+# rate-limited; over-limit packets fall through to the final drop in this chain.
+/ip firewall filter add action=accept chain=icmp comment="echo reply" icmp-options=0:0 limit=5,10:packet protocol=icmp
 /ip firewall filter add action=accept chain=icmp comment="net unreachable" icmp-options=3:0 protocol=icmp
 /ip firewall filter add action=accept chain=icmp comment="host unreachable" icmp-options=3:1 protocol=icmp
 /ip firewall filter add action=accept chain=icmp comment="host unreachable fragmentation required" icmp-options=3:4 protocol=icmp
-/ip firewall filter add action=accept chain=icmp comment="allow echo request" icmp-options=8:0 protocol=icmp
+/ip firewall filter add action=accept chain=icmp comment="allow echo request" icmp-options=8:0 limit=5,10:packet protocol=icmp
 /ip firewall filter add action=accept chain=icmp comment="allow time exceed" icmp-options=11:0 protocol=icmp
 /ip firewall filter add action=accept chain=icmp comment="allow parameter bad" icmp-options=12:0 protocol=icmp
 /ip firewall filter add action=drop chain=icmp comment="deny all other types"
 
 # NAT
-/ip firewall nat add action=masquerade chain=srcnat comment="Masquerade LAN -> WAN" out-interface=$wanIface
+/ip firewall nat add action=masquerade chain=srcnat comment="Masquerade LAN -> WAN" out-interface-list=$wanList
 
 # selective-VPN routing infrastructure (mtvpn-compatible comments)
 /routing table add name=$vpnTable fib
-/ip firewall mangle add chain=prerouting action=mark-connection connection-mark=no-mark dst-address-list=$vpnList in-interface=$lanIface new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-lan"
+/ip firewall mangle add chain=prerouting action=mark-connection connection-mark=no-mark dst-address-list=$vpnList in-interface-list=$lanList new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-lan"
 /ip firewall mangle add chain=output action=mark-connection connection-mark=no-mark dst-address-list=$vpnList new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-out"
-/ip firewall mangle add chain=prerouting action=mark-routing connection-mark=$vpnMark in-interface=$lanIface new-routing-mark=$vpnTable passthrough=no comment="mtvpn:route-pre"
+/ip firewall mangle add chain=prerouting action=mark-routing connection-mark=$vpnMark in-interface-list=$lanList new-routing-mark=$vpnTable passthrough=no comment="mtvpn:route-pre"
 /ip firewall mangle add chain=output action=mark-routing connection-mark=$vpnMark new-routing-mark=$vpnTable passthrough=no comment="mtvpn:route-out"
 # clamp TCP MSS on tunneled flows: VLESS/Reality encapsulation shrinks the path
 # MTU, so unclamped full-size segments stall ("some sites hang over VPN"). Match
@@ -157,6 +222,24 @@
 /ip service set www disabled=yes
 /ip service set api disabled=yes
 /ip service set api-ssl disabled=yes
+
+# Management plane: keep discovery and MAC-level access off the WAN. MAC-telnet
+# and MAC-Winbox bypass the IP firewall entirely, and after a no-defaults reset
+# they listen on every interface. Neighbor discovery defaults to every static
+# interface too, which broadcasts identity/version/MAC at the ISP.
+/ip neighbor discovery-settings set discover-interface-list=$lanList
+/tool mac-server set allowed-interface-list=$lanList
+/tool mac-server mac-winbox set allowed-interface-list=$lanList
+
+# IPv6: off. The whole selective-VPN path is IPv4 (/ip firewall address-list,
+# mangle, /ip route) and RouterOS will not put AAAA answers into an IPv4
+# address-list, so any IPv6 connectivity silently bypasses the tunnel — a
+# dual-stack client would reach an AAAA-capable service direct over the WAN.
+# Wrapped because /ipv6 does not exist when the ipv6 package is disabled, and an
+# unwrapped failure aborts the whole import. Takes effect after reboot.
+# (Want IPv6 instead? Port /ipv6 firewall from the stock defconf — but accept
+# that VPN routing will not apply to it.)
+:do { /ipv6 settings set disable-ipv6=yes } on-error={}
 
 # Telegram IP ranges updater (domain lists don't cover TG's raw-IP clients)
 # start-time=startup, not a wall-clock time: at import the RB3011 has no synced

@@ -22,7 +22,14 @@ Two parts:
 
 ## Setting up a new router
 
-Open `fresh-router.rsc` file and follow comments.
+Open `fresh-router.rsc` file and follow comments. Two things it does that affect
+the rest of this README:
+
+- **IPv6 is disabled** (takes effect on reboot). The selective-routing path is
+  IPv4-only, so a dual-stack client would otherwise reach an AAAA-capable service
+  direct over the WAN, silently bypassing the tunnel.
+- Firewall and mangle rules match on the interface lists `LANiface`/`WANiface`,
+  so that router's config needs `lan_list: LANiface` — see below.
 
 ## Config
 
@@ -39,7 +46,10 @@ gateway: 192.168.89.2
 list: to_vpn_list
 table: to_vpn_table
 mark: to_vpn_mark
-lan_list: LAN
+# interface *list* (not the LAN bridge) that the VPN mangle rules match on.
+# fresh-router.rsc creates LANiface/WANiface; mtvpn's built-in default is "LAN",
+# which on that router is the bridge. Only `bootstrap` reads this key.
+lan_list: LANiface
 # managed by add/remove, applied by update/bootstrap
 services:
   - anthropic
@@ -66,7 +76,9 @@ services:
 ./mtvpn.py search google           # v2fly service names matching "google"
 ./mtvpn.py domains openai          # domains a service resolves to
 
-# router without fresh-router.rsc: install the routing infra first
+# router without fresh-router.rsc: install the routing infra first.
+# Safe to run against a fresh-router.rsc router too — with lan_list: LANiface
+# set it finds every rule the template already made and adds nothing.
 ./mtvpn.py bootstrap --fix-fasttrack
 ```
 
