@@ -1,15 +1,52 @@
 # mtvpn
 
-Selective-VPN domain routing on MikroTik RouterOS 7. Domains from
-[v2fly/domain-list-community](https://github.com/v2fly/domain-list-community)
-(`anthropic`, `openai`, `telegram`, `netflix`, …) go through your VPN gateway,
-everything else goes direct.
+Selective-VPN domain routing on MikroTik RouterOS 7. Domains for the services you
+pick go through your VPN gateway, everything else goes direct.
 
 Two parts:
 
 - `fresh-router.rsc` — one-shot bootstrap template for a factory-fresh router.
 - `mtvpn.py` — python3 CLI that fetches the lists and pushes
   DNS + address-list entries to the router over SSH.
+
+## Domain sources
+
+Every service names its source explicitly. Nothing is inferred, and one source is
+never silently substituted for the other:
+
+| entry | source |
+|---|---|
+| `iplist:youtube.com` | [iplist.opencck.org](https://github.com/rekryt/iplist) — a **site** |
+| `iplist:apple` | iplist — a **group** (every site in it, here all 10 Apple ones) |
+| `iplist:beta:cloudflare.com` | iplist with the portal pinned (`main`/`beta`/`russia`) |
+| `v2fly:anthropic` | [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) |
+| `anthropic` | same as `v2fly:anthropic` — a bare name is the v2fly alias |
+| `https://…` | a raw URL in either format |
+
+iplist spreads its catalog over three portals (`main`, `beta`, `russia`) with almost
+no overlap, so `iplist:<selector>` tries each in turn and takes the first that has
+it. `search` shows which one that is:
+
+```sh
+./mtvpn.py search claude          # both sources
+./mtvpn.py search apple -s iplist # one source
+
+iplist:apple              beta    group  10 site(s)
+iplist:apple.com          beta    site   (apple)
+iplist:apple@icloud.com   beta    site   (apple)
+v2fly:apple
+```
+
+The router tag is the selector **without** its prefix, so `v2fly:youtube` still owns
+the `comment=youtube` entries a bare `youtube` installed. Switching a service to a
+differently-named selector (`v2fly:chesscom` → `iplist:chess.com`) changes the tag,
+so clear the old one out:
+
+```sh
+./mtvpn.py domains chesscom       # compare: bare name prints every source that has it
+./mtvpn.py remove chesscom        # drop the old tag's entries first
+./mtvpn.py add iplist:chess.com   # then install under the new one
+```
 
 ## Requirements
 
@@ -52,28 +89,29 @@ mark: to_vpn_mark
 lan_list: LANiface
 # managed by add/remove, applied by update/bootstrap
 services:
-  - anthropic
-  - openai
+  - v2fly:anthropic
+  - iplist:claude.ai
+  - iplist:beta:cloudflare.com
 ```
 
 ## Usage
 
 ```sh
-# add services (v2fly name or raw URL) — also appends them to the config
-./mtvpn.py add anthropic openai
-./mtvpn.py add https://raw.githubusercontent.com/v2fly/domain-list-community/refs/heads/master/data/openai
+# add services — also appends them to the config
+./mtvpn.py add v2fly:anthropic iplist:chatgpt.com
+./mtvpn.py add 'https://iplist.opencck.org/?format=text&data=domains&wildcard=1&site=youtube.com'
 
 ./mtvpn.py update                  # re-fetch upstream lists, refresh everything
 ./mtvpn.py remove netflix
 ./mtvpn.py list -v                 # what's installed on the router, by service
 
 # other router
-./mtvpn.py -c mtvpn-hex.yaml add openai
+./mtvpn.py -c mtvpn-hex.yaml add v2fly:openai
 
 # no router needed
-./mtvpn.py -n add anthropic        # dry-run: print the RouterOS commands
-./mtvpn.py render anthropic > anthropic.rsc   # for manual /import
-./mtvpn.py search google           # v2fly service names matching "google"
+./mtvpn.py -n add v2fly:anthropic  # dry-run: print the RouterOS commands
+./mtvpn.py render iplist:claude.ai > claude.rsc   # for manual /import
+./mtvpn.py search google           # selectors matching "google", both sources
 ./mtvpn.py domains openai          # domains a service resolves to
 
 # router without fresh-router.rsc: install the routing infra first.

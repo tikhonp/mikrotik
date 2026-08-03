@@ -11,8 +11,15 @@ Design (policy-based routing):
   - to_vpn_table has one default route via the VPN gateway with check-gateway=ping,
     so when the gateway dies traffic fails open to the main table (direct WAN)
 
-Domain sources: v2fly/domain-list-community service names (e.g. "anthropic",
-"openai") or any raw URL to a file in the same format.
+Domain sources, named explicitly per service and never inferred:
+  - iplist:<selector>   iplist.opencck.org, e.g. iplist:youtube.com (a site) or
+                        iplist:apple (a group). iplist:<portal>:<selector> pins
+                        the portal.
+  - v2fly:<name>        v2fly/domain-list-community, e.g. v2fly:anthropic. A bare
+                        name means this — what it meant before iplist existed.
+  - a raw URL to a file in either format.
+A selector that one source doesn't carry is an error, not a silent switch to the
+other; `search` lists what both have.
 
 Requires: python3 (stdlib only) and ssh key auth to the router.
 """
@@ -26,11 +33,22 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 V2FLY_BASE = "https://raw.githubusercontent.com/v2fly/domain-list-community/refs/heads/master/data/"
 V2FLY_TREE_API = "https://api.github.com/repos/v2fly/domain-list-community/git/trees/"
+
+# iplist.opencck.org portals, probed in this order. Their catalogs are near-disjoint
+# (only ui.com and anydesk.com appear on two), so the order rarely decides anything;
+# iplist:<portal>:<selector> pins it for the cases where it does.
+IPLIST_PORTALS = [
+    ("main", "https://iplist.opencck.org/"),
+    ("beta", "https://beta.iplist.opencck.org/"),
+    ("russia", "https://russia.iplist.opencck.org/"),
+]
+SOURCES = ("iplist", "v2fly")
 
 DEFAULTS = {
     "ssh": "",                # full ssh command, e.g. "ssh -J jumphost 10.0.0.1"
@@ -105,24 +123,156 @@ def save_config(path, cfg):
     Path(path).write_text(dump_yaml({k: cfg[k] for k in DEFAULTS if k in cfg}))
 
 
-def service_url(name_or_url):
-    """Return (service_name, url) for a v2fly service name or a raw URL."""
-    if "://" in name_or_url:
-        return name_or_url.rstrip("/").rsplit("/", 1)[-1].lower(), name_or_url
-    return name_or_url.lower(), V2FLY_BASE + name_or_url.lower()
+def parse_selector(name):
+    """Split a config entry into (source, portal, selector).
+
+    source is "iplist", "v2fly", "url", or None for a bare name — which every
+    command that must pick one treats as v2fly, the source bare names meant before
+    iplist existed. portal is set only by the iplist:<portal>:<selector> form.
+    """
+    name = name.strip()
+    if "://" in name:
+        return "url", None, name
+    src, sep, rest = name.partition(":")
+    src, rest = src.strip().lower(), rest.strip().lower()
+    if not sep or src not in SOURCES:
+        return None, None, name.lower()
+    if src == "v2fly":
+        return "v2fly", None, rest
+    portal, sep2, rest2 = rest.partition(":")
+    if not sep2:
+        return "iplist", None, rest
+    # Three parts can only be iplist:<portal>:<selector> — no site or group name
+    # contains a colon — so an unrecognised middle is a typo, not a selector.
+    if portal not in {p for p, _ in IPLIST_PORTALS}:
+        raise SystemExit(f"unknown iplist portal {portal!r}: expected one of "
+                         f"{', '.join(p for p, _ in IPLIST_PORTALS)}")
+    return "iplist", portal, rest2.strip()
 
 
-def fetch(url):
+def service_tag(name):
+    """Router comment tag for a config entry: its selector, minus the source prefix.
+
+    Network-free by contract — `remove` and the services bookkeeping in add/remove
+    must not need a fetch to know which entries a name owns. Dropping the prefix is
+    also what keeps v2fly:youtube pointed at the comment=youtube entries an older
+    mtvpn.yaml already installed.
+    """
+    src, _, sel = parse_selector(name)
+    if src != "url":
+        return sel
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(sel).query)
+    for kind in ("site", "group"):  # an iplist URL carries its selector in the query
+        if q.get(kind):
+            return q[kind][0].lower()
+    return sel.rstrip("/").rsplit("/", 1)[-1].lower()
+
+
+def fetch(url, missing_ok=False):
     req = urllib.request.Request(url, headers={"User-Agent": "mtvpn/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read().decode()
+    except urllib.error.HTTPError as e:
+        if missing_ok and e.code == 404:  # v2fly answers a missing list with 404
+            return None
+        raise
 
 
-def parse_list(url, seen=None):
-    """Parse a v2fly-format list. Returns (subdomain_domains, exact_domains, skipped).
+def iplist_url(base, kind, selector):
+    """Query URL for one iplist selector; `kind` is "site" or "group".
+
+    wildcard=1 is not optional: wildcard=0 returns every hostname the service has
+    ever been seen to use (15k+ for youtube), while the wildcard set is the apex
+    list whose meaning matches RouterOS match-subdomain=yes exactly.
+    """
+    return base + "?" + urllib.parse.urlencode(
+        {"format": "text", "data": "domains", "wildcard": "1", kind: selector})
+
+
+def iplist_find(selector, portal=None):
+    """Locate an iplist selector. Returns (source_label, url, text) or None.
+
+    A selector is either a site (youtube.com, apple@icloud.com, copilot) or a group
+    (apple, ai, youtube). The two never collide, but the shape doesn't tell them
+    apart either — the main portal has dotless sites — so both are probed.
+
+    A portal that doesn't carry the selector answers 200 with an empty body rather
+    than 404, so emptiness is the only "not here" signal there is. Which also means
+    an unreachable portal must not read as a miss: those are reported separately.
+    """
+    for name, base in [(p, b) for p, b in IPLIST_PORTALS if portal in (None, p)]:
+        for kind in ("site", "group"):
+            url = iplist_url(base, kind, selector)
+            try:
+                text = fetch(url)
+            except OSError as e:  # URLError/timeouts both land here
+                print(f"# iplist portal {name} unreachable: {e}", file=sys.stderr)
+                break  # don't retry the other kind against a dead portal
+            if text.strip():
+                return f"iplist {name} {kind}", url, text
+    return None
+
+
+def resolve_service(name):
+    """Map a config entry to (tag, url, source_label, text).
+
+    `text` is the already-fetched body when resolution had to download it to find
+    out whether the selector exists at all, else None. Sources are never inferred:
+    a selector no iplist portal carries is an error, not a quiet fall back to
+    v2fly — the other source is one prefix away.
+    """
+    src, portal, sel = parse_selector(name)
+    tag = service_tag(name)
+    if src == "url":
+        return tag, sel, "url", None
+    if src in (None, "v2fly"):
+        return tag, V2FLY_BASE + sel, "v2fly", None
+    found = iplist_find(sel, portal)
+    if not found:
+        where = portal or ", ".join(p for p, _ in IPLIST_PORTALS)
+        raise SystemExit(f"iplist: no site or group {sel!r} on {where}. Try "
+                         f"'mtvpn search {sel}', or 'v2fly:{sel}' for the GitHub list.")
+    label, url, text = found
+    return tag, url, label, text
+
+
+def service_variants(name):
+    """Every (tag, url, source_label, text) a name could install.
+
+    An explicitly sourced name or a URL resolves to exactly one. A bare name is
+    looked up in both sources, so `domains <name>` can show what each would give
+    before one of them is written into the config.
+    """
+    src, _, sel = parse_selector(name)
+    if src is not None:
+        return [resolve_service(name)]
+    out = []
+    text = fetch(V2FLY_BASE + sel, missing_ok=True)
+    if text is not None:
+        out.append((sel, V2FLY_BASE + sel, "v2fly", text))
+    found = iplist_find(sel)
+    if found:
+        label, url, itext = found
+        out.append((sel, url, label, itext))
+    if not out:
+        raise SystemExit(f"{sel!r}: no iplist site or group, and not in v2fly's "
+                         f"data/. Try 'mtvpn search {sel}'.")
+    return out
+
+
+def parse_list(url, seen=None, text=None):
+    """Parse a domain list. Returns (subdomain_domains, exact_domains, skipped).
 
     Handles: plain domains (match subdomains), full:, domain:, include: (recursive).
-    Skips regexp:/keyword: rules — RouterOS cannot express them.
+    Skips regexp:/keyword: rules — RouterOS cannot express them. iplist's output is
+    a subset of this format — bare domains, one per line — so it needs no parser of
+    its own, and the same DOMAIN_RE sweep drops the scraped junk it sometimes
+    carries ("mailto", "geoffk@apple.com" in the apple group).
+
+    `text`, when given, is the already-fetched body of `url`: resolving an iplist
+    selector has to download it to learn whether the selector exists, so it hands
+    over what it got instead of making this refetch.
     """
     if seen is None:
         seen = set()
@@ -133,7 +283,7 @@ def parse_list(url, seen=None):
     sub, full, skipped = set(), set(), []
     base = url.rsplit("/", 1)[0] + "/"
 
-    for raw in fetch(url).splitlines():
+    for raw in (fetch(url) if text is None else text).splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
@@ -423,9 +573,9 @@ def cmd_bootstrap(cfg, args):
     infra = rsc_bootstrap(cfg, fix_fasttrack=args.fix_fasttrack)
     script, pipe_script = list(infra), list(infra)
     for name in cfg["services"]:
-        svc, url = service_url(name)
-        sub, full, skipped = parse_list(url)
-        report_parse(svc, sub, full, skipped)
+        svc, url, source, text = resolve_service(name)
+        sub, full, skipped = parse_list(url, text=text)
+        report_parse(svc, sub, full, skipped, source)
         script += rsc_service(svc, sub, full, cfg)
         pipe_script += rsc_service(svc, sub, full, cfg, single_scope=False)
     push(cfg, script, args.dry_run, pipe_script=pipe_script)
@@ -438,14 +588,17 @@ def cmd_bootstrap(cfg, args):
 
 def cmd_add(cfg, args, config_path):
     for name in args.services:
-        svc, url = service_url(name)
-        sub, full, skipped = parse_list(url)
-        report_parse(svc, sub, full, skipped)
+        svc, url, source, text = resolve_service(name)
+        sub, full, skipped = parse_list(url, text=text)
+        report_parse(svc, sub, full, skipped, source)
         push(cfg, rsc_service(svc, sub, full, cfg), args.dry_run,
              pipe_script=rsc_service(svc, sub, full, cfg, single_scope=False))
         if not args.dry_run:
             print(f"added '{svc}' ({len(sub) + len(full)} domains) on {target(cfg)}")
-        if not args.dry_run and Path(config_path).exists() and name not in cfg["services"]:
+        # Dedupe by tag, not by spelling: `add anthropic` must not append a second
+        # entry when the config already carries it as v2fly:anthropic.
+        if (not args.dry_run and Path(config_path).exists()
+                and svc not in [service_tag(s) for s in cfg["services"]]):
             cfg["services"].append(name)
             save_config(config_path, cfg)
 
@@ -459,12 +612,12 @@ def cmd_update(cfg, args, config_path):
 
 def cmd_remove(cfg, args, config_path):
     for name in args.services:
-        svc, _ = service_url(name)
+        svc = service_tag(name)  # tag only: removing must never need the network
         push(cfg, rsc_remove_service(svc, cfg), args.dry_run)
         if not args.dry_run:
             print(f"removed '{svc}' from {target(cfg)}")
         if not args.dry_run and Path(config_path).exists():
-            cfg["services"] = [s for s in cfg["services"] if service_url(s)[0] != svc]
+            cfg["services"] = [s for s in cfg["services"] if service_tag(s) != svc]
             save_config(config_path, cfg)
 
 
@@ -489,26 +642,28 @@ def cmd_list(cfg, args):
 
 def cmd_render(cfg, args):
     for name in args.services:
-        svc, url = service_url(name)
-        sub, full, skipped = parse_list(url)
-        report_parse(svc, sub, full, skipped)
+        svc, url, source, text = resolve_service(name)
+        sub, full, skipped = parse_list(url, text=text)
+        report_parse(svc, sub, full, skipped, source)
         print("\n".join(rsc_service(svc, sub, full, cfg)))
 
 
 def cmd_domains(cfg, args):
-    """Print the resolved domains for service(s) from GitHub. No router needed.
+    """Print the resolved domains for service(s) upstream. No router needed.
 
     Subdomain-match domains print as-is; exact (v2fly full:) domains are prefixed
-    `full:` so the two match kinds stay distinguishable.
+    `full:` so the two match kinds stay distinguishable. A bare name prints one
+    block per source that carries it — the headers naming each source go to stderr
+    like every other diagnostic, so stdout stays a plain domain list to pipe.
     """
     for name in args.services:
-        svc, url = service_url(name)
-        sub, full, skipped = parse_list(url)
-        report_parse(svc, sub, full, skipped)
-        for d in sorted(sub):
-            print(d)
-        for d in sorted(full):
-            print(f"full:{d}")
+        for svc, url, source, text in service_variants(name):
+            sub, full, skipped = parse_list(url, text=text)
+            report_parse(svc, sub, full, skipped, source)
+            for d in sorted(sub):
+                print(d)
+            for d in sorted(full):
+                print(f"full:{d}")
 
 
 def list_services():
@@ -524,25 +679,66 @@ def list_services():
     return sorted(e["path"] for e in tree["tree"] if e["type"] == "blob")
 
 
+def iplist_catalog():
+    """Every (portal, group, site) triple iplist serves.
+
+    format=custom with a {group}|{site} template is the only endpoint that exposes
+    group membership; plain ?format=json does too, but ships the whole 40 MB config
+    dump to do it. It emits one line per domain, hence the dedupe. A site with no
+    wildcard domains at all never appears, which costs nothing — there would be
+    nothing to add from it anyway.
+    """
+    out = set()
+    for name, base in IPLIST_PORTALS:
+        url = base + "?" + urllib.parse.urlencode(
+            {"format": "custom", "data": "domains", "wildcard": "1",
+             "template": "{group}|{site}"})
+        try:
+            text = fetch(url)
+        except OSError as e:
+            print(f"# iplist portal {name} unreachable: {e}", file=sys.stderr)
+            continue
+        for line in text.splitlines():
+            group, sep, site = line.strip().partition("|")
+            if sep:
+                out.add((name, group, site))
+    return sorted(out)
+
+
 def cmd_search(cfg, args):
-    """List available v2fly service names, optionally filtered by substring."""
+    """List selectors from both sources, spelled the way a config entry is."""
     q = args.query.lower() if args.query else None
-    matched = [n for n in list_services() if q is None or q in n]
-    for n in matched:
-        print(n)
+    rows = []
+    if args.source in (None, "iplist"):
+        catalog = iplist_catalog()
+        sites = {}
+        for portal, group, site in catalog:
+            sites[(portal, group)] = sites.get((portal, group), 0) + 1
+        rows += [(f"iplist:{g}", p, "group", f"{n} site(s)") for (p, g), n in sites.items()]
+        rows += [(f"iplist:{s}", p, "site", f"({g})") for p, g, s in catalog]
+    if args.source in (None, "v2fly"):
+        try:
+            rows += [(f"v2fly:{n}", "", "", "") for n in list_services()]
+        except OSError as e:  # a GitHub outage/rate-limit shouldn't hide iplist's half
+            print(f"# v2fly listing unavailable: {e}", file=sys.stderr)
+    matched = [r for r in rows if q is None or q in r[0].lower()]
+    for ident, portal, kind, extra in sorted(matched):
+        print(f"{ident:<34}{portal:<8}{kind:<7}{extra}".rstrip())
     if q is not None:
         print(f"# {len(matched)} match(es) for {args.query!r}", file=sys.stderr)
 
 
-def report_parse(svc, sub, full, skipped):
-    print(f"# {svc}: {len(sub)} subdomain-match + {len(full)} exact domains", file=sys.stderr)
+def report_parse(svc, sub, full, skipped, source=None):
+    src = f" [{source}]" if source else ""
+    print(f"# {svc}{src}: {len(sub)} subdomain-match + {len(full)} exact domains",
+          file=sys.stderr)
     for s in skipped:
         print(f"#   skipped (unsupported on RouterOS): {s}", file=sys.stderr)
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Selective-VPN domain routing on MikroTik from v2fly domain lists")
+        description="Selective-VPN domain routing on MikroTik from iplist/v2fly domain lists")
     ap.add_argument("-c", "--config", default="mtvpn.yaml", help="config file (default mtvpn.yaml)")
     ap.add_argument("-r", "--router", metavar="SSH_CMD",
                     help='ssh command for the router, e.g. "ssh -J jumphost 10.0.0.1"')
@@ -558,13 +754,15 @@ def main():
                  ("update", "re-fetch and refresh services (default: all from config)"),
                  ("remove", "remove service(s) from the router"),
                  ("render", "print RouterOS commands for service(s) to stdout"),
-                 ("domains", "print resolved domains for service(s) from GitHub to stdout")]:
+                 ("domains", "print resolved domains for service(s) upstream to stdout")]:
         p = sp.add_parser(c, help=h)
         p.add_argument("services", nargs="*" if c == "update" else "+",
-                       help="v2fly service name or raw URL")
+                       help="iplist:<site|group>, v2fly:<name>, or a raw URL "
+                            "(a bare name means v2fly:)")
 
-    p = sp.add_parser("search", help="list available v2fly service names from GitHub")
-    p.add_argument("query", nargs="?", help="substring to filter service names")
+    p = sp.add_parser("search", help="list selectors available from iplist and v2fly")
+    p.add_argument("query", nargs="?", help="substring to filter selectors")
+    p.add_argument("-s", "--source", choices=SOURCES, help="only search this source")
 
     p = sp.add_parser("list", help="show services installed on the router")
     p.add_argument("-v", "--verbose", action="store_true", help="also list domains")
