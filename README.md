@@ -48,6 +48,50 @@ so clear the old one out:
 ./mtvpn.py add iplist:chess.com   # then install under the new one
 ```
 
+## Hosted service lists
+
+The set of services can live on a server instead of in every router's config. A
+service list is a plain text file, **one selector per line** — exactly what
+`services:` holds, so a `services:` block can be pasted in as-is (leading `- ` is
+stripped). `#` comments work at line start or after whitespace, which leaves raw-URL
+entries intact:
+
+```
+v2fly:youtube
+v2fly:telegram    # 21 domains
+iplist:claude.ai
+```
+
+Point a config at it and every `update` applies whatever the file says today:
+
+```yaml
+service_lists:
+  - https://files.example.com/mtvpn-tunneled.txt
+services:
+  - v2fly:anthropic     # this router only, on top of the list
+```
+
+```sh
+# install everything the list carries and record the URL in service_lists:
+./mtvpn.py add -l https://files.example.com/mtvpn-tunneled.txt
+
+./mtvpn.py update           # config services + every list, re-fetched
+./mtvpn.py update --prune   # ...and drop router services the lists no longer name
+./mtvpn.py remove -l https://files.example.com/mtvpn-tunneled.txt   # list and its services
+
+# one-off, without touching the config
+./mtvpn.py -c mtvpn-hex.yaml update -l ./tunneled.txt
+```
+
+`-l` takes a URL or a local path and is repeatable. `add`/`remove` record and
+forget the URL in `service_lists:`; `update` never edits the config, so a one-off
+`-l` stays one-off. Services named in both the config and a list are installed
+once, and `add`ing one a list already carries won't duplicate it into `services:`.
+
+`--prune` removes every service tag on the router that the effective set no longer
+names — including ones installed by hand. It only applies to a full `update` (no
+service arguments), and it leaves the router's own `telegram-cidr` entries alone.
+
 ## Requirements
 
 - RouterOS 7.x, SSH key auth
@@ -87,6 +131,9 @@ mark: to_vpn_mark
 # fresh-router.rsc creates LANiface/WANiface; mtvpn's built-in default is "LAN",
 # which on that router is the bridge. Only `bootstrap` reads this key.
 lan_list: LANiface
+# hosted service lists (URLs or paths), merged into services by update/bootstrap
+service_lists:
+  - https://files.example.com/mtvpn-tunneled.txt
 # managed by add/remove, applied by update/bootstrap
 services:
   - v2fly:anthropic
@@ -100,6 +147,8 @@ services:
 # add services — also appends them to the config
 ./mtvpn.py add v2fly:anthropic iplist:chatgpt.com
 ./mtvpn.py add 'https://iplist.opencck.org/?format=text&data=domains&wildcard=1&site=youtube.com'
+
+./mtvpn.py add -l https://files.example.com/mtvpn-tunneled.txt  # a hosted service list
 
 ./mtvpn.py update                  # re-fetch upstream lists, refresh everything
 ./mtvpn.py remove netflix

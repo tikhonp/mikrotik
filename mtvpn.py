@@ -21,6 +21,11 @@ Domain sources, named explicitly per service and never inferred:
 A selector that one source doesn't carry is an error, not a silent switch to the
 other; `search` lists what both have.
 
+The set of services itself can also live on a server: a hosted *service list* is
+one selector per line, referenced by the config's `service_lists:` or by
+--from-list, and `update` then applies whatever it says today (--prune to also
+drop what it stopped saying).
+
 Requires: python3 (stdlib only) and ssh key auth to the router.
 """
 
@@ -59,6 +64,7 @@ DEFAULTS = {
     "table": "to_vpn_table",
     "mark": "to_vpn_mark",
     "lan_list": "LAN",        # interface list whose traffic is subject to VPN routing
+    "service_lists": [],      # URLs/paths of hosted service lists (see read_service_list)
     "services": [],
 }
 
@@ -114,8 +120,9 @@ def load_config(path):
         cfg.update(parse_yaml(p.read_text()))
     if not cfg.get("ssh") and cfg.get("router"):  # legacy router/ssh_opts keys
         cfg["ssh"] = " ".join(["ssh"] + cfg.pop("ssh_opts", []) + [cfg.pop("router")])
-    if isinstance(cfg.get("services"), str):  # empty "services:" line parses as ""
-        cfg["services"] = [cfg["services"]] if cfg["services"] else []
+    for key in ("services", "service_lists"):  # an empty "key:" line parses as ""
+        if isinstance(cfg.get(key), str):
+            cfg[key] = [cfg[key]] if cfg[key] else []
     return cfg
 
 
@@ -177,6 +184,63 @@ def fetch(url, missing_ok=False):
         if missing_ok and e.code == 404:  # v2fly answers a missing list with 404
             return None
         raise
+
+
+_SERVICE_LISTS: dict = {}
+
+
+def read_service_list(src):
+    """Read a hosted list of *service selectors* (not domains): one per line.
+
+    The point is keeping the set of tunneled services on a server instead of in
+    every router's mtvpn.yaml — the file holds exactly what `services:` would
+    hold, so a `services:` block can be pasted in verbatim (a leading "- " is
+    stripped). `#` comments are honoured, but only at line start or after
+    whitespace, so a raw-URL entry keeps its query/fragment.
+
+    `src` is a URL or a local path. Cached per run: bootstrap/add both consult
+    the same lists and a hosted list must not change under us mid-command.
+    """
+    if src in _SERVICE_LISTS:
+        return _SERVICE_LISTS[src]
+    try:
+        text = fetch(src) if "://" in src else Path(src).expanduser().read_text()
+    except OSError as e:  # HTTPError/URLError are OSErrors too
+        raise SystemExit(f"service list {src}: {e}")
+    out = []
+    for raw in text.splitlines():
+        line = re.split(r"\s#", raw.strip(), maxsplit=1)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("- "):  # a pasted YAML services: block
+            line = line[2:].strip()
+        if not line or line.endswith(":"):  # e.g. the "services:" key itself
+            continue
+        if any(c.isspace() for c in line):
+            raise SystemExit(f"service list {src}: not a service selector: {line!r}")
+        out.append(line)
+    if not out:
+        raise SystemExit(f"service list {src}: no services in it")
+    _SERVICE_LISTS[src] = out
+    return out
+
+
+def expand_services(cfg, extra_lists=()):
+    """The effective service set: cfg["services"] plus every hosted list's entries.
+
+    Deduped by service_tag, so a service named in both the config and a list is
+    installed once and the config's spelling wins — that spelling is the one
+    `remove` and the config bookkeeping already match on.
+    """
+    names, seen = [], set()
+    for name in (list(cfg["services"])
+                 + [n for src in list(cfg.get("service_lists") or []) + list(extra_lists)
+                    for n in read_service_list(src)]):
+        tag = service_tag(name)
+        if tag not in seen:
+            seen.add(tag)
+            names.append(name)
+    return names
 
 
 def iplist_url(base, kind, selector):
@@ -572,7 +636,8 @@ def cmd_bootstrap(cfg, args):
     # per-service blocks differ between the /import and stdin forms.
     infra = rsc_bootstrap(cfg, fix_fasttrack=args.fix_fasttrack)
     script, pipe_script = list(infra), list(infra)
-    for name in cfg["services"]:
+    services = expand_services(cfg)
+    for name in services:
         svc, url, source, text = resolve_service(name)
         sub, full, skipped = parse_list(url, text=text)
         report_parse(svc, sub, full, skipped, source)
@@ -580,14 +645,62 @@ def cmd_bootstrap(cfg, args):
         pipe_script += rsc_service(svc, sub, full, cfg, single_scope=False)
     push(cfg, script, args.dry_run, pipe_script=pipe_script)
     if not args.dry_run:
-        print(f"bootstrapped {target(cfg)}: infra + {len(cfg['services'])} service(s)")
+        print(f"bootstrapped {target(cfg)}: infra + {len(services)} service(s)")
         print("NOTE: LAN clients must use the router as their only DNS server "
               "(DHCP dns-server, /ip dns allow-remote-requests=yes), or the "
               "FWD-based subdomain coverage will not populate the list.")
 
 
-def cmd_add(cfg, args, config_path):
+def named_services(args):
+    """The services one add/update/remove invocation covers: those named on the
+    command line, then everything --from-list carries, deduped by tag."""
+    names = list(args.services)
+    for src in (getattr(args, "from_list", None) or []):
+        names += read_service_list(src)
+    seen, out = set(), []
+    for name in names:
+        tag = service_tag(name)
+        if tag not in seen:
+            seen.add(tag)
+            out.append(name)
+    return out
+
+
+def record_config(cfg, config_path, args):
+    """Write back what `add` installed: the --from-list URLs, then the explicitly
+    named services the config's lists don't already carry.
+
+    Dedupe is by tag, not by spelling, at both levels: `add anthropic` must not
+    append a second entry when the config (or one of its lists) already carries
+    it as v2fly:anthropic.
+    """
+    changed = False
+    for src in (args.from_list or []):
+        if src not in cfg["service_lists"]:
+            cfg["service_lists"].append(src)
+            changed = True
+    covered = {service_tag(n) for n in cfg["services"]}
+    try:
+        covered |= {service_tag(n) for src in cfg["service_lists"]
+                    for n in read_service_list(src)}
+    except SystemExit:  # a list unreadable right now must not lose the bookkeeping
+        pass
     for name in args.services:
+        if service_tag(name) not in covered:
+            cfg["services"].append(name)
+            covered.add(service_tag(name))
+            changed = True
+    if changed:
+        save_config(config_path, cfg)
+
+
+def cmd_add(cfg, args, config_path, persist=True):
+    """Install/refresh services. persist=False for `update`, which is a refresh of
+    what the config already points at and must not graft a one-off list into it."""
+    services = named_services(args)
+    if not services:
+        raise SystemExit("nothing to add: no services given and no list entries")
+    for name in services:
         svc, url, source, text = resolve_service(name)
         sub, full, skipped = parse_list(url, text=text)
         report_parse(svc, sub, full, skipped, source)
@@ -595,23 +708,43 @@ def cmd_add(cfg, args, config_path):
              pipe_script=rsc_service(svc, sub, full, cfg, single_scope=False))
         if not args.dry_run:
             print(f"added '{svc}' ({len(sub) + len(full)} domains) on {target(cfg)}")
-        # Dedupe by tag, not by spelling: `add anthropic` must not append a second
-        # entry when the config already carries it as v2fly:anthropic.
-        if (not args.dry_run and Path(config_path).exists()
-                and svc not in [service_tag(s) for s in cfg["services"]]):
-            cfg["services"].append(name)
-            save_config(config_path, cfg)
+    if persist and not args.dry_run and Path(config_path).exists():
+        record_config(cfg, config_path, args)
 
 
 def cmd_update(cfg, args, config_path):
-    args.services = args.services or cfg["services"]
+    # Pruning against a subset of the services would delete every service not
+    # named, so it is only offered for the full refresh.
+    if args.services and args.prune:
+        raise SystemExit("--prune only applies to a full update (no service arguments)")
+    # No explicit services: refresh the whole effective set — config services plus
+    # everything the hosted lists carry, which is how a list edited on the server
+    # reaches the router.
+    args.services = args.services or expand_services(cfg, args.from_list or [])
     if not args.services:
         raise SystemExit("nothing to update: no services given and none in config")
-    cmd_add(cfg, args, config_path)
+    cmd_add(cfg, args, config_path, persist=False)
+    if args.prune:
+        prune_services(cfg, args)
+
+
+def prune_services(cfg, args):
+    """Drop router services no longer in the effective set — how a service dropped
+    from a hosted list stops being tunneled."""
+    if args.dry_run or not cfg["ssh"]:
+        print("# --prune needs the router; skipped", file=sys.stderr)
+        return
+    stale = router_service_tags(cfg) - {service_tag(n) for n in args.services}
+    for svc in sorted(stale):
+        push(cfg, rsc_remove_service(svc, cfg))
+        print(f"pruned '{svc}' from {target(cfg)}")
 
 
 def cmd_remove(cfg, args, config_path):
-    for name in args.services:
+    services = named_services(args)
+    if not services:
+        raise SystemExit("nothing to remove: no services given and no list entries")
+    for name in services:
         svc = service_tag(name)  # tag only: removing must never need the network
         push(cfg, rsc_remove_service(svc, cfg), args.dry_run)
         if not args.dry_run:
@@ -619,6 +752,26 @@ def cmd_remove(cfg, args, config_path):
         if not args.dry_run and Path(config_path).exists():
             cfg["services"] = [s for s in cfg["services"] if service_tag(s) != svc]
             save_config(config_path, cfg)
+    if not args.dry_run and Path(config_path).exists() and (args.from_list or []):
+        # the list itself goes too, else the next update reinstalls everything
+        cfg["service_lists"] = [s for s in cfg["service_lists"] if s not in args.from_list]
+        save_config(config_path, cfg)
+
+
+def router_service_tags(cfg):
+    """Service tags installed on the router, read off the DNS static entries.
+
+    DNS static and not the address list, so the router-side telegram-cidr script
+    (address-list entries only) is invisible here and `--prune` leaves it alone.
+    Untagged entries yield "" and are dropped: their tag would match every
+    adopted entry.
+    """
+    lines = query(
+        cfg,
+        ':foreach i in=[/ip dns static find where address-list="%s"] '
+        'do={:put [:tostr [/ip dns static get $i comment]]}' % cfg["list"],
+    )
+    return {l.strip() for l in lines if l.strip()}
 
 
 def cmd_list(cfg, args):
@@ -756,9 +909,18 @@ def main():
                  ("render", "print RouterOS commands for service(s) to stdout"),
                  ("domains", "print resolved domains for service(s) upstream to stdout")]:
         p = sp.add_parser(c, help=h)
-        p.add_argument("services", nargs="*" if c == "update" else "+",
+        p.add_argument("services", nargs="*" if c in ("update", "add", "remove") else "+",
                        help="iplist:<site|group>, v2fly:<name>, or a raw URL "
                             "(a bare name means v2fly:)")
+        if c in ("add", "update", "remove"):
+            p.add_argument("-l", "--from-list", metavar="URL", action="append",
+                           help="URL or path of a hosted service list (one selector "
+                                "per line); repeatable. add/remove also record it "
+                                "in the config's service_lists:")
+        if c == "update":
+            p.add_argument("--prune", action="store_true",
+                           help="also remove router services that are no longer in "
+                                "the config or its lists")
 
     p = sp.add_parser("search", help="list selectors available from iplist and v2fly")
     p.add_argument("query", nargs="?", help="substring to filter selectors")
