@@ -223,6 +223,8 @@
 /ip service set api disabled=yes
 /ip service set api-ssl disabled=yes
 
+/tool graphing resource add store-on-disk=yes
+
 # Management plane: keep discovery and MAC-level access off the WAN. MAC-telnet
 # and MAC-Winbox bypass the IP firewall entirely, and after a no-defaults reset
 # they listen on every interface. Neighbor discovery defaults to every static
