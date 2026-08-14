@@ -9,35 +9,21 @@
 #
 # PREREQUISITES (before import)
 #   - Clean config:      /system reset-configuration no-defaults=yes skip-backup=yes
-#   - Enable containers: /system/device-mode/update container=yes
-#                        (requires power-button press or reboot to confirm)
-#   - USB disk:          plug in, then  /disk format-drive usb1 file-system=ext4
-#                        (adjust slot name if not usb1)
-#   - SSH key:           /user ssh-keys import public-key-file=<your-key>.pub user=admin
-#                        (then disable password-authentication)
-#                        after confirming SSH key login works, also run:
+#   - Device mode:       /system/device-mode/update mode=advanced container=yes scheduler=yes fetch=yes
+#                        Verify with: /system device-mode print
+#   - USB disk:          /disk format usb1 file-system=ext4
+#   - SSH key:           /user ssh-keys import public-key-file=key.pub user=...
 #                        /ip ssh set password-authentication=no
 #   - Disable admin:     /user disable admin
-#                        (after confirming your own user can log in)
-#   - Copy files:        scp <your-key>.pub <config-fresh-router>.rsc admin@<router-ip>:
 #
-# AFTER IMPORT
-#   - The container image is pulled automatically; netwatch starts it once
-#     extracted (within ~1-2 min). Check:  /container print
-#   - Verify VPN egress:  /tool fetch url=https://ifconfig.me/ip output=user
-#     (ifconfig.me must first be added to the list, e.g. via mtvpn or manually)
-#   - Once SSH key login works, harden:  /ip ssh set password-authentication=no
-#   - Reboot once: the IPv6 disable below only takes effect on restart.
-#   - `mtvpn bootstrap` is compatible with this router (it finds every mtvpn:*
-#     rule below and adds nothing) *provided* the config sets lan_list: LANiface.
 
 # PARAMETERS
 # LAN /24 prefix (no trailing dot). Router gets .1, DHCP hands out .20-.254
-:local lanNet "10.230.1"
+:local lanNet "10.220.1"
 # WAN port (gets its address via DHCP client)
 :local wanIface "ether1"
 # mihomo subscription URL (SUB1 env of the container)
-:local subUrl "https://f.........rptn.txt"
+:local subUrl "https://files.tikhonnnnn.com/share/g53vy3i9waby/sbscrptn.txt"
 # container image
 :local image "registry-1.docker.io/wiktorbgu/mihomo-mikrotik:latest"
 :local timeZone "Europe/Moscow"
@@ -69,6 +55,15 @@
 # container internal /24: router side = .1, mihomo veth = .2 = the VPN gateway
 :local containerNet "192.168.89"
 :local vpnGateway ($containerNet . ".2")
+
+# PRECHECK device-mode
+:foreach need in={"container";"scheduler";"fetch"} do={
+    :if ([/system device-mode get $need] != true) do={
+        :error ("device-mode blocks '" . $need . "' (mode=" . [/system device-mode get mode] . \
+            "). Run: /system/device-mode/update mode=advanced container=yes scheduler=yes fetch=yes " . \
+            "then confirm with the reset button, and re-run this import.")
+    }
+}
 
 # bridges & ports
 /interface bridge add name=$lanIface
@@ -225,28 +220,7 @@
 
 /tool graphing resource add store-on-disk=yes
 
-# Management plane: keep discovery and MAC-level access off the WAN. MAC-telnet
-# and MAC-Winbox bypass the IP firewall entirely, and after a no-defaults reset
-# they listen on every interface. Neighbor discovery defaults to every static
-# interface too, which broadcasts identity/version/MAC at the ISP.
-/ip neighbor discovery-settings set discover-interface-list=$lanList
-/tool mac-server set allowed-interface-list=$lanList
-/tool mac-server mac-winbox set allowed-interface-list=$lanList
-
-# IPv6: off. The whole selective-VPN path is IPv4 (/ip firewall address-list,
-# mangle, /ip route) and RouterOS will not put AAAA answers into an IPv4
-# address-list, so any IPv6 connectivity silently bypasses the tunnel — a
-# dual-stack client would reach an AAAA-capable service direct over the WAN.
-# Wrapped because /ipv6 does not exist when the ipv6 package is disabled, and an
-# unwrapped failure aborts the whole import. Takes effect after reboot.
-# (Want IPv6 instead? Port /ipv6 firewall from the stock defconf — but accept
-# that VPN routing will not apply to it.)
-:do { /ipv6 settings set disable-ipv6=yes } on-error={}
-
 # Telegram IP ranges updater (domain lists don't cover TG's raw-IP clients)
-# start-time=startup, not a wall-clock time: at import the RB3011 has no synced
-# clock yet (no battery RTC), so a fixed start-time pins start-date to the stale
-# pre-NTP date and next-run stays in the past forever -- the scheduler never fires.
 /system scheduler add interval=6h name=Update_Telegram_IPs on-event="/system script run Update_Telegram_CIDR" policy=read,write,policy,test start-time=startup
 /system script
 add dont-require-permissions=no name=Update_Telegram_CIDR owner=tikhon \
@@ -366,3 +340,9 @@ add dont-require-permissions=no name=Update_Telegram_CIDR owner=tikhon \
     \n# 5. cleanup - always reached\
     \n/ip route remove [find comment=\$routeTag]\
     \n:log info \"TG CIDR: finished\"")
+
+/ip neighbor discovery-settings set discover-interface-list=$lanList
+/tool mac-server set allowed-interface-list=$lanList
+/tool mac-server mac-winbox set allowed-interface-list=$lanList
+
+:do { /ipv6 settings set disable-ipv6=yes } on-error={}
