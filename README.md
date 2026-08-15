@@ -21,7 +21,25 @@ never silently substituted for the other:
 | `iplist:beta:cloudflare.com` | iplist with the portal pinned (`main`/`beta`/`russia`) |
 | `v2fly:anthropic` | [v2fly/domain-list-community](https://github.com/v2fly/domain-list-community) |
 | `anthropic` | same as `v2fly:anthropic` — a bare name is the v2fly alias |
-| `https://…` | a raw URL in either format |
+| `https://…` | a raw URL in either format — including your own list of domains |
+| `mine=https://…` | the same, with the router tag named explicitly |
+
+### Your own domain list
+
+Any URL serving one domain per line works as a source — that format is a subset of
+v2fly's, so no prefix or conversion is needed:
+
+```sh
+./mtvpn.py -n add https://files.example.com/tunneled-domains.txt   # dry-run first
+./mtvpn.py add https://files.example.com/tunneled-domains.txt
+```
+
+The tag comes from the URL's last path segment minus its extension
+(`tunneled-domains`), so `update` re-reads the URL and `remove tunneled-domains`
+clears it. Two lists whose filenames match would collide under one tag, so name them
+instead — `mine=https://…` makes the tag `mine` whatever the URL says. `full:`,
+`domain:` and `include:` lines are honoured if you use them; `regexp:`/`keyword:`
+lines are reported as skipped, since RouterOS cannot express them.
 
 iplist spreads its catalog over three portals (`main`, `beta`, `russia`) with almost
 no overlap, so `iplist:<selector>` tries each in turn and takes the first that has

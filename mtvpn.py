@@ -17,7 +17,8 @@ Domain sources, named explicitly per service and never inferred:
                         the portal.
   - v2fly:<name>        v2fly/domain-list-community, e.g. v2fly:anthropic. A bare
                         name means this — what it meant before iplist existed.
-  - a raw URL to a file in either format.
+  - a raw URL to a file in either format — including a plain one-domain-per-line
+    list of your own. `<tag>=<url>` names it; otherwise the tag comes from the URL.
 A selector that one source doesn't carry is an error, not a silent switch to the
 other; `search` lists what both have.
 
@@ -54,6 +55,13 @@ IPLIST_PORTALS = [
     ("russia", "https://russia.iplist.opencck.org/"),
 ]
 SOURCES = ("iplist", "v2fly")
+
+# `<tag>=<url>`: `=` separates only when a bare tag precedes it and a URL scheme
+# follows, so a plain URL carrying a query string is never split.
+NAMED_URL_RE = re.compile(r"^([a-z0-9][a-z0-9._-]*)=(?=[a-z][a-z0-9+.-]*://)", re.I)
+# Extensions dropped when deriving a tag from a URL: a custom list is usually
+# served as a file, and "domains.txt" makes a poor router comment.
+TAG_EXTENSIONS = (".txt", ".list", ".lst", ".dat", ".conf", ".md")
 
 DEFAULTS = {
     "ssh": "",                # full ssh command, e.g. "ssh -J jumphost 10.0.0.1"
@@ -130,14 +138,26 @@ def save_config(path, cfg):
     Path(path).write_text(dump_yaml({k: cfg[k] for k in DEFAULTS if k in cfg}))
 
 
+def split_named_url(name):
+    """Split the optional `<tag>=<url>` form. Returns (tag or None, rest).
+
+    A custom domain list has no upstream name to borrow, so its tag would otherwise
+    be whatever the URL's last path segment happens to be — which two lists on
+    different hosts can easily share, silently merging them under one comment.
+    """
+    m = NAMED_URL_RE.match(name)
+    return (m.group(1).lower(), name[m.end():]) if m else (None, name)
+
+
 def parse_selector(name):
     """Split a config entry into (source, portal, selector).
 
     source is "iplist", "v2fly", "url", or None for a bare name — which every
     command that must pick one treats as v2fly, the source bare names meant before
     iplist existed. portal is set only by the iplist:<portal>:<selector> form.
+    For a URL the selector is the URL itself, with any `<tag>=` prefix stripped.
     """
-    name = name.strip()
+    name = split_named_url(name.strip())[1]
     if "://" in name:
         return "url", None, name
     src, sep, rest = name.partition(":")
@@ -168,11 +188,21 @@ def service_tag(name):
     src, _, sel = parse_selector(name)
     if src != "url":
         return sel
+    tag, _ = split_named_url(name.strip())
+    if tag:  # <tag>=<url> says outright what the entry is called
+        return tag
     q = urllib.parse.parse_qs(urllib.parse.urlparse(sel).query)
     for kind in ("site", "group"):  # an iplist URL carries its selector in the query
         if q.get(kind):
             return q[kind][0].lower()
-    return sel.rstrip("/").rsplit("/", 1)[-1].lower()
+    parts = urllib.parse.urlparse(sel)
+    # Never fall through to "": the empty tag is what untagged/adopted entries carry,
+    # so an entry named "" would own every one of them.
+    leaf = (parts.path.rstrip("/").rsplit("/", 1)[-1] or parts.netloc).lower()
+    for ext in TAG_EXTENSIONS:
+        if leaf.endswith(ext) and len(leaf) > len(ext):
+            return leaf[: -len(ext)]
+    return leaf
 
 
 def fetch(url, missing_ok=False):
@@ -910,7 +940,8 @@ def main():
                  ("domains", "print resolved domains for service(s) upstream to stdout")]:
         p = sp.add_parser(c, help=h)
         p.add_argument("services", nargs="*" if c in ("update", "add", "remove") else "+",
-                       help="iplist:<site|group>, v2fly:<name>, or a raw URL "
+                       help="iplist:<site|group>, v2fly:<name>, or a raw URL of a "
+                            "domain list, optionally named <tag>=<url> "
                             "(a bare name means v2fly:)")
         if c in ("add", "update", "remove"):
             p.add_argument("-l", "--from-list", metavar="URL", action="append",
