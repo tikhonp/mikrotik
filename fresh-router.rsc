@@ -109,7 +109,7 @@
 # plain A record, no address-list= -> mtvpn never touches it (it only ever
 # finds/removes /ip dns static entries that carry address-list=)
 /ip dns static add address=($lanNet . ".1") name=router.lan type=A
-/ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=100 doh-max-server-connections=20 doh-timeout=10s cache-size=16384KiB
+/ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
 
 # firewall address lists
 /ip firewall address-list add list=lan_nets address=($lanNet . ".0/24")
