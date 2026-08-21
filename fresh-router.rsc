@@ -9,6 +9,14 @@
 #
 # PREREQUISITES (before import)
 #   - Clean config:      /system reset-configuration no-defaults=yes skip-backup=yes
+#   - Container package: /system package print   must list an enabled "container".
+#                        It is an EXTRA package, not part of the routeros bundle:
+#                        download the "Extra packages" archive for this board's
+#                        architecture (RB5009 = arm64), upload container-*.npk,
+#                        /system reboot. Without it the /interface veth and
+#                        /container commands below fail to resolve and RouterOS
+#                        rejects the WHOLE import - the symptom is "nothing
+#                        happened at all, the router has no LAN address".
 #   - Device mode:       /system/device-mode/update mode=advanced container=yes scheduler=yes fetch=yes
 #                        Verify with: /system device-mode print
 #   - USB disk:          /disk format usb1 file-system=ext4
@@ -19,11 +27,11 @@
 
 # PARAMETERS
 # LAN /24 prefix (no trailing dot). Router gets .1, DHCP hands out .20-.254
-:local lanNet "10.220.1"
+:local lanNet "10.230.1"
 # WAN port (gets its address via DHCP client)
 :local wanIface "ether1"
 # mihomo subscription URL (SUB1 env of the container)
-:local subUrl "https://files.tikhonnnnn.com/share/g53vy3i9waby/sbscrptn.txt"
+:local subUrl "https://files....t"
 # container image
 :local image "registry-1.docker.io/wiktorbgu/mihomo-mikrotik:latest"
 :local timeZone "Europe/Moscow"
@@ -56,13 +64,21 @@
 :local containerNet "192.168.89"
 :local vpnGateway ($containerNet . ".2")
 
-# PRECHECK device-mode
+# PRECHECK device-mode. Deliberately NOT :error - aborting here used to leave the
+# router with no LAN address and no way in except MAC-Winbox. Only the container
+# section is skipped; everything that makes the router reachable still runs.
+:local containerOk true
 :foreach need in={"container";"scheduler";"fetch"} do={
     :if ([/system device-mode get $need] != true) do={
-        :error ("device-mode blocks '" . $need . "' (mode=" . [/system device-mode get mode] . \
-            "). Run: /system/device-mode/update mode=advanced container=yes scheduler=yes fetch=yes " . \
-            "then confirm with the reset button, and re-run this import.")
+        :set containerOk false
+        :put ("!! device-mode blocks '" . $need . "' (mode=" . [/system device-mode get mode] . \
+            ") - container setup will be SKIPPED")
+        :log warning ("fresh-router: device-mode blocks " . $need)
     }
+}
+:if ($containerOk = false) do={
+    :put "!! fix with: /system/device-mode/update mode=advanced container=yes scheduler=yes fetch=yes"
+    :put "!! then confirm with the reset button / power cycle, and re-run this import."
 }
 
 # bridges & ports
@@ -83,6 +99,7 @@
 # interface lists. The *bridge* is the member, not its ports: for routed traffic
 # the IP firewall sees the bridge as in-interface, so listing the ports instead
 # would match nothing.
+:put "stage: bridges+ports ok"
 /interface list add name=$lanList
 /interface list add name=$wanList
 /interface list member add list=$lanList interface=$lanIface
@@ -91,9 +108,12 @@
 # router services (the input chain drops anything not from LAN), and its egress
 # is never mistaken for LAN traffic by the VPN mangle rules below.
 
-# container veth (internal subnet $containerNet.0/24; veth .2 = VPN gateway)
-/interface veth add name=$vethName address=($containerNet . ".2/24") gateway=($containerNet . ".1")
-/interface bridge port add bridge=$containerIface interface=$vethName
+# The container veth is created later, next to the container itself: it is the
+# first command here that can fail on a device without the container package or
+# without device-mode container=yes, and nothing above this point must depend on
+# it. Addressing and DHCP come first so a container failure never costs LAN access.
+
+:put "stage: interface lists ok"
 
 # addressing / DHCP
 /ip address add address=($lanNet . ".1/24") interface=$lanIface
@@ -110,6 +130,8 @@
 # finds/removes /ip dns static entries that carry address-list=)
 /ip dns static add address=($lanNet . ".1") name=router.lan type=A
 /ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
+
+:put "stage: addressing/DHCP/DNS ok"
 
 # firewall address lists
 /ip firewall address-list add list=lan_nets address=($lanNet . ".0/24")
@@ -186,6 +208,8 @@
 # NAT
 /ip firewall nat add action=masquerade chain=srcnat comment="Masquerade LAN -> WAN" out-interface-list=$wanList
 
+:put "stage: firewall ok"
+
 # selective-VPN routing infrastructure (mtvpn-compatible comments)
 /routing table add name=$vpnTable fib
 /ip firewall mangle add chain=prerouting action=mark-connection connection-mark=no-mark dst-address-list=$vpnList in-interface-list=$lanList new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-lan"
@@ -199,13 +223,29 @@
 /ip firewall mangle add chain=forward action=change-mss new-mss=1360 passthrough=yes protocol=tcp tcp-flags=syn connection-mark=$vpnMark tcp-mss=1361-65535 comment="mtvpn:mss-clamp"
 /ip route add dst-address=0.0.0.0/0 gateway=$vpnGateway routing-table=$vpnTable check-gateway=ping comment="mtvpn:route"
 
-# container
-/container config set registry-url=https://registry-1.docker.io tmpdir=usb1/container-tmp layer-dir=usb1/container-tmp/layer
-/container envs add key=SUB1 list=mihomo value=$subUrl
-/container add remote-image=$image interface=$vethName envlists=mihomo dns=8.8.8.8,8.8.4.4 root-dir=usb1/container-tmp/docker/mihomo start-on-boot=yes
-
-# container watchdog: restart mihomo if its IP stops answering
-/tool netwatch add host=$vpnGateway interval=1m timeout=2s type=simple down-script="/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted\""
+# container + its veth + its watchdog. One :do block: each of these depends on the
+# previous one, and the usual failures (no container package, device-mode not
+# confirmed, usb1 not formatted) all surface here. on-error keeps the import going
+# so the rest of the router is still configured and reachable.
+:if ($containerOk) do={
+    :do {
+        # veth on the container bridge; .2 is the VPN gateway the routes point at
+        /interface veth add name=$vethName address=($containerNet . ".2/24") gateway=($containerNet . ".1")
+        /interface bridge port add bridge=$containerIface interface=$vethName
+        /container config set registry-url=https://registry-1.docker.io tmpdir=usb1/container-tmp layer-dir=usb1/container-tmp/layer
+        /container envs add key=SUB1 list=mihomo value=$subUrl
+        /container add remote-image=$image interface=$vethName envlists=mihomo dns=8.8.8.8,8.8.4.4 root-dir=usb1/container-tmp/docker/mihomo start-on-boot=yes
+        # watchdog: restart mihomo if its IP stops answering
+        /tool netwatch add host=$vpnGateway interval=1m timeout=2s type=simple down-script="/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted\""
+        :put "container: ok"
+    } on-error={
+        :put "!! container setup FAILED - check: /system package print (container installed?),"
+        :put "!! /system device-mode print, /disk print (usb1 formatted ext4?)"
+        :log error "fresh-router: container setup failed"
+    }
+} else={
+    :put "container: skipped (device-mode)"
+}
 
 # system
 /system clock set time-zone-name=$timeZone
@@ -346,3 +386,5 @@ add dont-require-permissions=no name=Update_Telegram_CIDR owner=tikhon \
 /tool mac-server mac-winbox set allowed-interface-list=$lanList
 
 :do { /ipv6 settings set disable-ipv6=yes } on-error={}
+
+:put "fresh-router: import finished"
