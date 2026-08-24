@@ -123,13 +123,27 @@
 /ip dhcp-server network add address=($lanNet . ".0/24") gateway=($lanNet . ".1") dns-server=($lanNet . ".1")
 /ip dhcp-client add interface=$wanIface use-peer-dns=no disabled=no
 
-# DNS: DoH to ControlD's unfiltered p0 profile (bootstrapped by static A records).
-/ip dns static add address=76.76.2.11 name=freedns.controld.com type=A
-/ip dns static add address=76.76.10.11 name=freedns.controld.com type=A
+# DNS: split-horizon DoH, both halves Google Public DNS. A DoH query is TLS on
+# 443, so the firewall cannot tell one name from another - the only way to send
+# *some* queries through the tunnel is to give them their own destination IP.
+# Hence one resolver reached at two addresses, each pinned by a static A record
+# (which also bootstraps DoH itself: nothing can resolve those names yet).
+#   dns.google  -> 8.8.8.8   the global upstream, straight out the WAN
+#   8888.google -> 8.8.4.4   the vpn-doh forwarder, put in $vpnList further down
+#                            so mtvpn:conn-out/mtvpn:route-out send it through the
+#                            tunnel; those names then resolve from the exit node's
+#                            vantage point, and the answers are real addresses.
+# Both names are SANs on the Google Public DNS certificate, so verify-doh-cert
+# stays on for both - note the forwarder's own verify-doh-cert is a stub on 7.24.1
+# (accepted, stores nil); verification is inherited from the global /ip dns one. Exactly one A record per name: a second address would let
+# RouterOS reach the server over whichever path it happened to pick.
+/ip dns static add address=8.8.8.8 name=dns.google type=A
+/ip dns static add address=8.8.4.4 name=8888.google type=A
+/ip dns forwarders add name=vpn-doh doh-servers=https://8888.google/dns-query verify-doh-cert=yes
 # plain A record, no address-list= -> mtvpn never touches it (it only ever
 # finds/removes /ip dns static entries that carry address-list=)
 /ip dns static add address=($lanNet . ".1") name=router.lan type=A
-/ip dns set allow-remote-requests=yes use-doh-server=https://freedns.controld.com/p0 verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
+/ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
 
 :put "stage: addressing/DHCP/DNS ok"
 
@@ -212,6 +226,14 @@
 
 # selective-VPN routing infrastructure (mtvpn-compatible comments)
 /routing table add name=$vpnTable fib
+# First, keep the router's own DoH to the global resolver out of the tunnel. Its
+# address can land in $vpnList by accident - any tunneled service that resolves to
+# it adds it dynamically, and ping2.ui.com (in the ubiquiti list) is literally
+# 8.8.8.8 - which would tunnel the global path too, silently, since it still
+# resolves fine. accept in mangle = stop processing this chain, so it must precede
+# mtvpn:conn-out. chain=output only: a LAN client reaching the same address is a
+# different question, and the service lists own that one.
+/ip firewall mangle add chain=output action=accept dst-address=8.8.8.8 protocol=tcp dst-port=443 comment="mtvpn:doh-direct"
 /ip firewall mangle add chain=prerouting action=mark-connection connection-mark=no-mark dst-address-list=$vpnList in-interface-list=$lanList new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-lan"
 /ip firewall mangle add chain=output action=mark-connection connection-mark=no-mark dst-address-list=$vpnList new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-out"
 /ip firewall mangle add chain=prerouting action=mark-routing connection-mark=$vpnMark in-interface-list=$lanList new-routing-mark=$vpnTable passthrough=no comment="mtvpn:route-pre"
@@ -222,6 +244,10 @@
 # -> both directions covered, no dependence on the container interface name.
 /ip firewall mangle add chain=forward action=change-mss new-mss=1360 passthrough=yes protocol=tcp tcp-flags=syn connection-mark=$vpnMark tcp-mss=1361-65535 comment="mtvpn:mss-clamp"
 /ip route add dst-address=0.0.0.0/0 gateway=$vpnGateway routing-table=$vpnTable check-gateway=ping comment="mtvpn:route"
+# the vpn-doh forwarder's own address, so its queries ride mtvpn:conn-out /
+# mtvpn:route-out into the tunnel. An mtvpn: comment rather than a service tag,
+# so `mtvpn remove` / `mtvpn update --prune` can never sweep the pin away.
+/ip firewall address-list add list=$vpnList address=8.8.4.4 comment="mtvpn:doh"
 
 # container + its veth + its watchdog. One :do block: each of these depends on the
 # previous one, and the usual failures (no container package, device-mode not

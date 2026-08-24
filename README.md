@@ -134,6 +134,29 @@ service arguments), and it leaves the router's own `telegram-cidr` entries alone
 > LAN clients must use **the router as their only DNS server** — otherwise
   subdomain coverage silently breaks. For ex. if you use tailscale, it would work only if `--accept-dns=false` is set and host uses router as DNS in /etc/resolv.conf.
 
+### Split-horizon DNS (optional)
+
+With the `doh*` keys set, the names in your service lists are resolved *through
+the tunnel* and everything else straight out the WAN. Google then answers those
+queries from the exit node's vantage point, so the addresses that land in
+`to_vpn_list` are the ones nearest the path they will actually be fetched over.
+The answers are ordinary real A records — no fake-ip, no synthesised ranges.
+
+Both halves are the same resolver reached at two addresses, because routing
+cannot see inside TLS. `bootstrap` pins each hostname to its address, puts
+`doh_vpn_ip` in the VPN address-list (where the existing `mtvpn:conn-out` /
+`mtvpn:route-out` rules already tunnel router-originated traffic — no extra
+mangle rule), creates the forwarder, and sets the global server. If the gateway
+dies, `check-gateway=ping` withdraws the route and these queries fall back to
+the WAN along with everything else.
+
+It also adds one rule, `mtvpn:doh-direct`, that keeps the router's own traffic to
+`doh_ip` out of the tunnel. That is not belt-and-braces: any tunneled service that
+happens to resolve to the global resolver's address puts it in `to_vpn_list`
+dynamically — `ping2.ui.com`, in the v2fly `ubiquiti` list, *is* 8.8.8.8 — and
+without the rule every query would go through the tunnel while still resolving
+perfectly, so nothing would look wrong.
+
 ## Setting up a new router
 
 Open `fresh-router.rsc` file and follow comments. Two things it does that affect
@@ -164,6 +187,16 @@ mark: to_vpn_mark
 # fresh-router.rsc creates LANiface/WANiface; mtvpn's built-in default is "LAN",
 # which on that router is the bridge. Only `bootstrap` reads this key.
 lan_list: LANiface
+# Split-horizon DoH (optional; leave all five out and mtvpn never touches /ip dns).
+# The two upstreams are the same resolver at two addresses on purpose — a DoH
+# query is TLS on 443, so the firewall cannot tell one name from another, and the
+# only way to send *some* queries through the tunnel is to give them their own
+# destination IP. Each hostname must therefore be pinned to exactly one address.
+doh: https://dns.google/dns-query      # global upstream: straight out the WAN
+doh_ip: 8.8.8.8
+doh_vpn: https://8888.google/dns-query # upstream for tunneled services only
+doh_vpn_ip: 8.8.4.4                    # also pinned into `list`, so it routes via the VPN
+doh_forwarder: vpn-doh                 # /ip dns forwarders name; forward-to= on every entry
 # hosted service lists (URLs or paths), merged into services by update/bootstrap
 service_lists:
   - https://files.example.com/mtvpn-tunneled.txt
