@@ -39,7 +39,17 @@ The tag comes from the URL's last path segment minus its extension
 clears it. Two lists whose filenames match would collide under one tag, so name them
 instead — `mine=https://…` makes the tag `mine` whatever the URL says. `full:`,
 `domain:` and `include:` lines are honoured if you use them; `regexp:`/`keyword:`
-lines are reported as skipped, since RouterOS cannot express them.
+lines are reported as skipped, since RouterOS cannot express them. `#` starts a
+comment anywhere in the line, so a list can be annotated:
+
+```
+# work stuff
+example.com        # only the apex is needed, subdomains match too
+full:exact.example.org
+```
+
+Since these lists change more often than the curated upstreams, `update --urls-only`
+refreshes just them and leaves the iplist/v2fly services untouched.
 
 iplist spreads its catalog over three portals (`main`, `beta`, `russia`) with almost
 no overlap, so `iplist:<selector>` tries each in turn and takes the first that has
@@ -93,8 +103,9 @@ services:
 # install everything the list carries and record the URL in service_lists:
 ./mtvpn.py add -l https://files.example.com/mtvpn-tunneled.txt
 
-./mtvpn.py update           # config services + every list, re-fetched
-./mtvpn.py update --prune   # ...and drop router services the lists no longer name
+./mtvpn.py update              # config services + every list, re-fetched
+./mtvpn.py update --urls-only  # only your own domain lists (raw URLs), not iplist/v2fly
+./mtvpn.py update --prune      # ...and drop router services the lists no longer name
 ./mtvpn.py remove -l https://files.example.com/mtvpn-tunneled.txt   # list and its services
 
 # one-off, without touching the config
@@ -105,6 +116,10 @@ services:
 forget the URL in `service_lists:`; `update` never edits the config, so a one-off
 `-l` stays one-off. Services named in both the config and a list are installed
 once, and `add`ing one a list already carries won't duplicate it into `services:`.
+
+`--urls-only` narrows the refresh to services whose source is a raw URL — your own
+domain lists, which you edit far more often than iplist or v2fly change. It cannot be
+combined with `--prune`, which would then sweep every service it skipped.
 
 `--prune` removes every service tag on the router that the effective set no longer
 names — including ones installed by hand. It only applies to a full `update` (no
@@ -169,6 +184,7 @@ services:
 ./mtvpn.py add -l https://files.example.com/mtvpn-tunneled.txt  # a hosted service list
 
 ./mtvpn.py update                  # re-fetch upstream lists, refresh everything
+./mtvpn.py update --urls-only      # refresh only your own raw-URL domain lists
 ./mtvpn.py remove netflix
 ./mtvpn.py list -v                 # what's installed on the router, by service
 

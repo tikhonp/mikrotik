@@ -18,7 +18,8 @@ Domain sources, named explicitly per service and never inferred:
   - v2fly:<name>        v2fly/domain-list-community, e.g. v2fly:anthropic. A bare
                         name means this — what it meant before iplist existed.
   - a raw URL to a file in either format — including a plain one-domain-per-line
-    list of your own. `<tag>=<url>` names it; otherwise the tag comes from the URL.
+    list of your own, `#` comments and all. `<tag>=<url>` names it; otherwise the
+    tag comes from the URL. `update --urls-only` refreshes just these.
 A selector that one source doesn't carry is an error, not a silent switch to the
 other; `search` lists what both have.
 
@@ -744,13 +745,21 @@ def cmd_add(cfg, args, config_path, persist=True):
 
 def cmd_update(cfg, args, config_path):
     # Pruning against a subset of the services would delete every service not
-    # named, so it is only offered for the full refresh.
-    if args.services and args.prune:
-        raise SystemExit("--prune only applies to a full update (no service arguments)")
+    # named, so it is only offered for the full refresh — --urls-only is such a
+    # subset, and pruning against it would sweep every v2fly/iplist service.
+    if (args.services or args.urls_only) and args.prune:
+        raise SystemExit("--prune only applies to a full update "
+                         "(no service arguments, no --urls-only)")
     # No explicit services: refresh the whole effective set — config services plus
     # everything the hosted lists carry, which is how a list edited on the server
     # reaches the router.
     args.services = args.services or expand_services(cfg, args.from_list or [])
+    if args.urls_only:
+        # Your own domain lists change far more often than the curated upstreams,
+        # so this refreshes just them instead of re-fetching every service.
+        args.services = [n for n in args.services if parse_selector(n)[0] == "url"]
+        if not args.services:
+            raise SystemExit("nothing to update: no raw-URL domain lists among the services")
     if not args.services:
         raise SystemExit("nothing to update: no services given and none in config")
     cmd_add(cfg, args, config_path, persist=False)
@@ -949,6 +958,9 @@ def main():
                                 "per line); repeatable. add/remove also record it "
                                 "in the config's service_lists:")
         if c == "update":
+            p.add_argument("--urls-only", action="store_true",
+                           help="only refresh services whose source is a raw URL "
+                                "domain list, skipping the iplist/v2fly ones")
             p.add_argument("--prune", action="store_true",
                            help="also remove router services that are no longer in "
                                 "the config or its lists")
