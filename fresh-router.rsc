@@ -123,13 +123,13 @@
 /ip dhcp-server network add address=($lanNet . ".0/24") gateway=($lanNet . ".1") dns-server=($lanNet . ".1")
 /ip dhcp-client add interface=$wanIface use-peer-dns=no disabled=no
 
-# DNS: DoH to dns.google (bootstrapped by static A records)
-/ip dns static add address=8.8.8.8 name=dns.google type=A
-/ip dns static add address=8.8.4.4 name=dns.google type=A
+# DNS: DoH to ControlD's unfiltered p0 profile (bootstrapped by static A records).
+/ip dns static add address=76.76.2.11 name=freedns.controld.com type=A
+/ip dns static add address=76.76.10.11 name=freedns.controld.com type=A
 # plain A record, no address-list= -> mtvpn never touches it (it only ever
 # finds/removes /ip dns static entries that carry address-list=)
 /ip dns static add address=($lanNet . ".1") name=router.lan type=A
-/ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
+/ip dns set allow-remote-requests=yes use-doh-server=https://freedns.controld.com/p0 verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
 
 :put "stage: addressing/DHCP/DNS ok"
 
