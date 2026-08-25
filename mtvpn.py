@@ -82,6 +82,12 @@ DEFAULTS = {
     "doh_vpn": "",            # DoH URL used for tunneled services
     "doh_vpn_ip": "",         # address `doh_vpn` is pinned to; also pinned into `list`
     "doh_forwarder": "",      # /ip dns forwarders name = forward-to= on service entries
+    # Seconds to wait for a push. A full bootstrap writes ~2 objects per domain,
+    # so a few thousand domains on a slow board runs for minutes — and a client-
+    # side timeout kills the ssh session, which aborts /import partway and can
+    # leave a service with its old entries removed and the new ones not yet added.
+    # Generous by design: the transport is one-shot bulk work, not a health check.
+    "push_timeout": 1800,
     "service_lists": [],      # URLs/paths of hosted service lists (see read_service_list)
     "services": [],
 }
@@ -146,6 +152,10 @@ def load_config(path):
     for key in ("services", "service_lists"):  # an empty "key:" line parses as ""
         if isinstance(cfg.get(key), str):
             cfg[key] = [cfg[key]] if cfg[key] else []
+    try:  # parse_yaml yields strings; every use of this one is a number
+        cfg["push_timeout"] = int(cfg["push_timeout"])
+    except (TypeError, ValueError):
+        raise SystemExit(f"config: push_timeout must be a number, got {cfg['push_timeout']!r}")
     return cfg
 
 
@@ -719,7 +729,7 @@ def _push_stdin(cfg, text):
     """Fallback transport: pipe the script into the interactive console."""
     r = subprocess.run(
         ssh_base(cfg),
-        input=text, capture_output=True, text=True, timeout=300,
+        input=text, capture_output=True, text=True, timeout=cfg["push_timeout"],
     )
     _report((r.stdout + r.stderr).splitlines())
     if r.returncode != 0:
@@ -734,14 +744,14 @@ def _push_import(cfg, text):
         with os.fdopen(fd, "w") as f:
             f.write(text)
         s = subprocess.run(scp_base(cfg, local, remote),
-                           capture_output=True, text=True, timeout=300)
+                           capture_output=True, text=True, timeout=cfg["push_timeout"])
         if s.returncode != 0:
             _report((s.stdout + s.stderr).splitlines())
             raise SystemExit(f"scp to {target(cfg)} failed (exit {s.returncode})")
         try:
             r = subprocess.run(
                 ssh_base(cfg) + [f"/import file-name={remote} verbose=no"],
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, text=True, timeout=cfg["push_timeout"],
             )
             out = (r.stdout + r.stderr).splitlines()
             _report(out)
