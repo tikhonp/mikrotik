@@ -41,21 +41,11 @@
 :local containerIface "container"
 :local vethName "vless"
 
-# interface *lists*. Every firewall/mangle rule below matches on these rather
-# than on interface names, so a second LAN segment or WAN uplink is a one-line
-# membership change. Named distinctly from the bridges on purpose: RouterOS does
-# not document whether a list may share a name with an interface, and a rejected
-# /interface list add would abort the whole import.
+# interface *lists* names
 :local lanList "LANiface"
 :local wanList "WANiface"
 
-# selective-VPN routing names — MUST match this router's mtvpn <config>.yaml
-# (list: / table: / mark: / lan_list:) or mtvpn add/update/remove won't line up
-# with the rules created below. In particular set
-#     lan_list: LANiface
-# in that config: mtvpn's built-in default is "LAN", which on this router is the
-# *bridge*, not a list, so `mtvpn bootstrap` would emit in-interface-list=LAN
-# and fail to add its prerouting rules.
+# selective-VPN routing names
 :local vpnList "to_vpn_list"
 :local vpnTable "to_vpn_table"
 :local vpnMark "to_vpn_mark"
@@ -64,9 +54,12 @@
 :local containerNet "192.168.89"
 :local vpnGateway ($containerNet . ".2")
 
-# PRECHECK device-mode. Deliberately NOT :error - aborting here used to leave the
-# router with no LAN address and no way in except MAC-Winbox. Only the container
-# section is skipped; everything that makes the router reachable still runs.
+# the DoH resolver.
+:local dohHost "dns.google"
+:local dohIP "8.8.8.8"
+:local dohUrl ("https://" . $dohHost . "/dns-query")
+
+# PRECHECK device-mode.
 :local containerOk true
 :foreach need in={"container";"scheduler";"fetch"} do={
     :if ([/system device-mode get $need] != true) do={
@@ -123,27 +116,10 @@
 /ip dhcp-server network add address=($lanNet . ".0/24") gateway=($lanNet . ".1") dns-server=($lanNet . ".1")
 /ip dhcp-client add interface=$wanIface use-peer-dns=no disabled=no
 
-# DNS: split-horizon DoH, both halves Google Public DNS. A DoH query is TLS on
-# 443, so the firewall cannot tell one name from another - the only way to send
-# *some* queries through the tunnel is to give them their own destination IP.
-# Hence one resolver reached at two addresses, each pinned by a static A record
-# (which also bootstraps DoH itself: nothing can resolve those names yet).
-#   dns.google  -> 8.8.8.8   the global upstream, straight out the WAN
-#   8888.google -> 8.8.4.4   the vpn-doh forwarder, put in $vpnList further down
-#                            so mtvpn:conn-out/mtvpn:route-out send it through the
-#                            tunnel; those names then resolve from the exit node's
-#                            vantage point, and the answers are real addresses.
-# Both names are SANs on the Google Public DNS certificate, so verify-doh-cert
-# stays on for both - note the forwarder's own verify-doh-cert is a stub on 7.24.1
-# (accepted, stores nil); verification is inherited from the global /ip dns one. Exactly one A record per name: a second address would let
-# RouterOS reach the server over whichever path it happened to pick.
-/ip dns static add address=8.8.8.8 name=dns.google type=A
-/ip dns static add address=8.8.4.4 name=8888.google type=A
-/ip dns forwarders add name=vpn-doh doh-servers=https://8888.google/dns-query verify-doh-cert=yes
-# plain A record, no address-list= -> mtvpn never touches it (it only ever
-# finds/removes /ip dns static entries that carry address-list=)
+/ip dns static add address=$dohIP name=$dohHost type=A
 /ip dns static add address=($lanNet . ".1") name=router.lan type=A
-/ip dns set allow-remote-requests=yes use-doh-server=https://dns.google/dns-query verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
+
+/ip dns set allow-remote-requests=yes use-doh-server=$dohUrl verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
 
 :put "stage: addressing/DHCP/DNS ok"
 
@@ -226,14 +202,6 @@
 
 # selective-VPN routing infrastructure (mtvpn-compatible comments)
 /routing table add name=$vpnTable fib
-# First, keep the router's own DoH to the global resolver out of the tunnel. Its
-# address can land in $vpnList by accident - any tunneled service that resolves to
-# it adds it dynamically, and ping2.ui.com (in the ubiquiti list) is literally
-# 8.8.8.8 - which would tunnel the global path too, silently, since it still
-# resolves fine. accept in mangle = stop processing this chain, so it must precede
-# mtvpn:conn-out. chain=output only: a LAN client reaching the same address is a
-# different question, and the service lists own that one.
-/ip firewall mangle add chain=output action=accept dst-address=8.8.8.8 protocol=tcp dst-port=443 comment="mtvpn:doh-direct"
 /ip firewall mangle add chain=prerouting action=mark-connection connection-mark=no-mark dst-address-list=$vpnList in-interface-list=$lanList new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-lan"
 /ip firewall mangle add chain=output action=mark-connection connection-mark=no-mark dst-address-list=$vpnList new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-out"
 /ip firewall mangle add chain=prerouting action=mark-routing connection-mark=$vpnMark in-interface-list=$lanList new-routing-mark=$vpnTable passthrough=no comment="mtvpn:route-pre"
@@ -244,10 +212,15 @@
 # -> both directions covered, no dependence on the container interface name.
 /ip firewall mangle add chain=forward action=change-mss new-mss=1360 passthrough=yes protocol=tcp tcp-flags=syn connection-mark=$vpnMark tcp-mss=1361-65535 comment="mtvpn:mss-clamp"
 /ip route add dst-address=0.0.0.0/0 gateway=$vpnGateway routing-table=$vpnTable check-gateway=ping comment="mtvpn:route"
-# the vpn-doh forwarder's own address, so its queries ride mtvpn:conn-out /
-# mtvpn:route-out into the tunnel. An mtvpn: comment rather than a service tag,
-# so `mtvpn remove` / `mtvpn update --prune` can never sweep the pin away.
-/ip firewall address-list add list=$vpnList address=8.8.4.4 comment="mtvpn:doh"
+# the DoH resolver, so every query the router makes rides mtvpn:conn-out /
+# mtvpn:route-out into the tunnel. By hostname, not by address: RouterOS refuses a
+# static entry duplicating a dynamic one in the same list, and this address gets
+# there dynamically all by itself - ping2.ui.com, in the ubiquiti list, *is*
+# 8.8.8.8. A hostname entry merges into that dynamic entry instead of colliding
+# with it, and the static A record above is what resolves it before DoH is up.
+# An mtvpn: comment rather than a service tag, so `mtvpn remove` /
+# `mtvpn update --prune` can never sweep the pin away.
+/ip firewall address-list add list=$vpnList address=$dohHost comment="mtvpn:doh"
 
 # container + its veth + its watchdog. One :do block: each of these depends on the
 # previous one, and the usual failures (no container package, device-mode not
@@ -261,8 +234,21 @@
         /container config set registry-url=https://registry-1.docker.io tmpdir=usb1/container-tmp layer-dir=usb1/container-tmp/layer
         /container envs add key=SUB1 list=mihomo value=$subUrl
         /container add remote-image=$image interface=$vethName envlists=mihomo dns=8.8.8.8,8.8.4.4 root-dir=usb1/container-tmp/docker/mihomo start-on-boot=yes
-        # watchdog: restart mihomo if its IP stops answering
-        /tool netwatch add host=$vpnGateway interval=1m timeout=2s type=simple down-script="/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted\""
+        # two watchdogs, because the two ways this breaks look different here.
+        # 1. container down: the veth stops answering. Probe the gateway itself -
+        #    the VPN route has gone inactive by then and everything else fails
+        #    open to the WAN, so a probe aimed further out would be answered
+        #    directly and hide the outage.
+        /tool netwatch add host=$vpnGateway interval=1m timeout=2s type=simple comment="mtvpn:watch-gw" down-script="/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted (gateway down)\""
+        # 2. container up, tunnel dead: mihomo answers ping but forwards nothing,
+        #    so check-gateway sees a live gateway and the route stays active.
+        #    $dohIP:443 is in $vpnList (pinned above), so this probe rides
+        #    mtvpn:conn-out through the tunnel and fails on exactly the address
+        #    and port DoH uses. tcp-conn, not simple: ICMP can survive a proxy
+        #    whose TCP outbound is dead. 3m, not 1m: a restarted mihomo needs
+        #    time to fetch its subscription and connect, and a 1m probe would
+        #    restart it again before it ever converged.
+        /tool netwatch add host=$dohIP port=443 interval=3m timeout=5s type=tcp-conn comment="mtvpn:watch-tunnel" down-script="/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted (tunnel dead)\""
         :put "container: ok"
     } on-error={
         :put "!! container setup FAILED - check: /system package print (container installed?),"

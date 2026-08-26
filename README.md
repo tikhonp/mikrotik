@@ -3,11 +3,11 @@
 Selective-VPN domain routing on MikroTik RouterOS 7. Domains for the services you
 pick go through your VPN gateway, everything else goes direct.
 
-Two parts:
+Two parts, with a clean split of ownership:
 
-- `fresh-router.rsc` — one-shot bootstrap template for a factory-fresh router.
-- `mtvpn.py` — python3 CLI that fetches the lists and pushes
-  DNS + address-list entries to the router over SSH.
+- `fresh-router.rsc` — one-shot `/import` template for a factory-fresh router.
+- `mtvpn.py` — python3 CLI that fetches domain lists and fills that address-list
+  over SSH.
 
 ## Domain sources
 
@@ -127,35 +127,41 @@ service arguments), and it leaves the router's own `telegram-cidr` entries alone
 
 ## Requirements
 
+- A router set up from `fresh-router.rsc` (or the same rules by hand — see below)
 - RouterOS 7.x, SSH key auth
 - python3, no pip installs
-- A VPN gateway reachable from the router as a next-hop IP
 
 > LAN clients must use **the router as their only DNS server** — otherwise
   subdomain coverage silently breaks. For ex. if you use tailscale, it would work only if `--accept-dns=false` is set and host uses router as DNS in /etc/resolv.conf.
 
-### Split-horizon DNS (optional)
+### Tunneled DNS
 
-With the `doh*` keys set, the names in your service lists are resolved *through
-the tunnel* and everything else straight out the WAN. Google then answers those
-queries from the exit node's vantage point, so the addresses that land in
-`to_vpn_list` are the ones nearest the path they will actually be fetched over.
-The answers are ordinary real A records — no fake-ip, no synthesised ranges.
+`fresh-router.rsc` sends **every** query the router makes through the tunnel. A DoH
+query is TLS on 443, so the firewall cannot tell one name from another — there is
+no per-query routing decision to be had, only a per-address one. So there is one
+resolver, `dns.google`, pinned by a static A record and put into `to_vpn_list` by
+hostname: the `mtvpn:conn-out` / `mtvpn:route-out` rules already tunnel
+router-originated traffic to anything listed, so no extra rule is involved.
 
-Both halves are the same resolver reached at two addresses, because routing
-cannot see inside TLS. `bootstrap` pins each hostname to its address, puts
-`doh_vpn_ip` in the VPN address-list (where the existing `mtvpn:conn-out` /
-`mtvpn:route-out` rules already tunnel router-originated traffic — no extra
-mangle rule), creates the forwarder, and sets the global server. If the gateway
-dies, `check-gateway=ping` withdraws the route and these queries fall back to
-the WAN along with everything else.
+Answers are ordinary real A records — no fake-ip, no synthesised ranges — so the
+`address-list=` mechanism is untouched, and mtvpn's service entries keep doing
+exactly one job: putting the addresses they resolve into `to_vpn_list`. If the
+container dies, `check-gateway=ping` withdraws the route and DNS falls back to
+the WAN along with everything else — an inactive route in a marked table is a
+lookup miss, and RouterOS retries a miss in `main`.
 
-It also adds one rule, `mtvpn:doh-direct`, that keeps the router's own traffic to
-`doh_ip` out of the tunnel. That is not belt-and-braces: any tunneled service that
-happens to resolve to the global resolver's address puts it in `to_vpn_list`
-dynamically — `ping2.ui.com`, in the v2fly `ubiquiti` list, *is* 8.8.8.8 — and
-without the rule every query would go through the tunnel while still resolving
-perfectly, so nothing would look wrong.
+That fallback does *not* cover a container that is running while its tunnel is
+dead: the veth still answers ping, so the route stays active and DoH dies inside
+the tunnel. Since `/ip dns` carries no plain `servers=`, that takes the whole
+LAN's DNS with it. Two netwatch probes cover the two cases — `mtvpn:watch-gw` on
+the veth, and `mtvpn:watch-tunnel` opening TCP to `8.8.8.8:443` through the
+tunnel — and both restart mihomo.
+
+The trade-off is deliberate: names resolve from the exit node's vantage point
+whether they are tunneled or not, so CDN answers for *direct* traffic are
+geolocated to the exit node too. In exchange the router has one DNS path instead
+of two, and an ISP filtering your resolver on the WAN (ICMP admin-prohibited on
+`8.8.8.8:443` is a real thing) can no longer see it.
 
 ## Setting up a new router
 
@@ -165,8 +171,13 @@ the rest of this README:
 - **IPv6 is disabled** (takes effect on reboot). The selective-routing path is
   IPv4-only, so a dual-stack client would otherwise reach an AAAA-capable service
   direct over the WAN, silently bypassing the tunnel.
-- Firewall and mangle rules match on the interface lists `LANiface`/`WANiface`,
-  so that router's config needs `lan_list: LANiface` — see below.
+- Firewall and mangle rules match on the interface lists `LANiface`/`WANiface`
+  rather than on the LAN bridge.
+
+Everything the routing needs lives there, so `mtvpn.yaml` only has to name the
+address-list to fill. To use mtvpn against a router set up some other way, give it
+the equivalent of the template's `mtvpn:*` rules and point `list:` at whatever
+address-list they match on.
 
 ## Config
 
@@ -178,29 +189,13 @@ ssh: ssh -J jumphost 10.230.1.1
 # optional: override the scp command derived from ssh: for the /import fast
 # path (leave empty to auto-derive). {local}/{remote} are substituted.
 # scp: scp -J jumphost {local} 10.230.1.1:{remote}
-# next-hop IP of the VPN gateway (container veth / tunnel peer)
-gateway: 192.168.89.2
+# the address-list the router routes through the tunnel — the one router-side
+# name mtvpn needs. fresh-router.rsc creates it and the rules that act on it.
 list: to_vpn_list
-table: to_vpn_table
-mark: to_vpn_mark
-# interface *list* (not the LAN bridge) that the VPN mangle rules match on.
-# fresh-router.rsc creates LANiface/WANiface; mtvpn's built-in default is "LAN",
-# which on that router is the bridge. Only `bootstrap` reads this key.
-lan_list: LANiface
-# Split-horizon DoH (optional; leave all five out and mtvpn never touches /ip dns).
-# The two upstreams are the same resolver at two addresses on purpose — a DoH
-# query is TLS on 443, so the firewall cannot tell one name from another, and the
-# only way to send *some* queries through the tunnel is to give them their own
-# destination IP. Each hostname must therefore be pinned to exactly one address.
-doh: https://dns.google/dns-query      # global upstream: straight out the WAN
-doh_ip: 8.8.8.8
-doh_vpn: https://8888.google/dns-query # upstream for tunneled services only
-doh_vpn_ip: 8.8.4.4                    # also pinned into `list`, so it routes via the VPN
-doh_forwarder: vpn-doh                 # /ip dns forwarders name; forward-to= on every entry
-# hosted service lists (URLs or paths), merged into services by update/bootstrap
+# hosted service lists (URLs or paths), merged into services by update
 service_lists:
   - https://files.example.com/mtvpn-tunneled.txt
-# managed by add/remove, applied by update/bootstrap
+# managed by add/remove, applied by update
 services:
   - v2fly:anthropic
   - iplist:claude.ai
@@ -229,11 +224,6 @@ services:
 ./mtvpn.py render iplist:claude.ai > claude.rsc   # for manual /import
 ./mtvpn.py search google           # selectors matching "google", both sources
 ./mtvpn.py domains openai          # domains a service resolves to
-
-# router without fresh-router.rsc: install the routing infra first.
-# Safe to run against a fresh-router.rsc router too — with lan_list: LANiface
-# set it finds every rule the template already made and adds nothing.
-./mtvpn.py bootstrap --fix-fasttrack
 ```
 
 `render`, `domains` and `search` never touch the router; everything else takes

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""mtvpn — bootstrap and manage selective-VPN domain routing on MikroTik RouterOS 7.
+"""mtvpn — manage the selective-VPN domain list on MikroTik RouterOS 7.
 
-Design (policy-based routing):
-  - domains land in a firewall address-list (default: to_vpn_list) via two mechanisms:
-      1. DNS static FWD entries with match-subdomain=yes  -> covers every subdomain
-         a LAN client resolves (dynamic list entries, renewed on each query)
-      2. firewall address-list hostname entries           -> apex A records,
-         continuously re-resolved by the firewall, survive DNS cache flushes
-  - mangle marks connections to listed IPs (to_vpn_mark), marks routing (to_vpn_table)
-  - to_vpn_table has one default route via the VPN gateway with check-gateway=ping,
-    so when the gateway dies traffic fails open to the main table (direct WAN)
+mtvpn owns exactly one thing: what is in the firewall address-list (default:
+to_vpn_list). The routing that acts on that list — mangle marks, routing table,
+fail-open default route, tunneled DoH — is the router's own config, installed
+once by fresh-router.rsc and never touched from here.
+
+Domains land in the list by two mechanisms:
+  1. DNS static FWD entries with match-subdomain=yes  -> covers every subdomain
+     a LAN client resolves (dynamic list entries, renewed on each query)
+  2. firewall address-list hostname entries           -> apex A records,
+     continuously re-resolved by the firewall, survive DNS cache flushes
 
 Domain sources, named explicitly per service and never inferred:
   - iplist:<selector>   iplist.opencck.org, e.g. iplist:youtube.com (a site) or
@@ -68,21 +69,12 @@ DEFAULTS = {
     "ssh": "",                # full ssh command, e.g. "ssh -J jumphost 10.0.0.1"
     "scp": "",                # optional scp template override with {local}/{remote}
                               # placeholders; derived from ssh when empty
-    "gateway": "",            # next-hop IP of the VPN gateway (container/tunnel peer)
+    # The firewall address-list the router already routes through the tunnel —
+    # fresh-router.rsc creates it along with the mangle rules, routing table and
+    # DoH pin that act on it. This is the only router-side name mtvpn needs: it
+    # fills the list and nothing else.
     "list": "to_vpn_list",
-    "table": "to_vpn_table",
-    "mark": "to_vpn_mark",
-    "lan_list": "LAN",        # interface list whose traffic is subject to VPN routing
-    # Split-horizon DoH (all optional; empty = mtvpn never touches /ip dns).
-    # The two upstreams are the same resolver reached at two addresses, because
-    # routing cannot see inside TLS: the only way to send *some* queries through
-    # the tunnel is to give them their own destination IP.
-    "doh": "",                # global DoH URL -> /ip dns set use-doh-server
-    "doh_ip": "",             # the one address `doh`'s hostname is pinned to
-    "doh_vpn": "",            # DoH URL used for tunneled services
-    "doh_vpn_ip": "",         # address `doh_vpn` is pinned to; also pinned into `list`
-    "doh_forwarder": "",      # /ip dns forwarders name = forward-to= on service entries
-    # Seconds to wait for a push. A full bootstrap writes ~2 objects per domain,
+    # Seconds to wait for a push. A full refresh writes ~2 objects per domain,
     # so a few thousand domains on a slow board runs for minutes — and a client-
     # side timeout kills the ssh session, which aborts /import partway and can
     # leave a service with its old entries removed and the new ones not yet added.
@@ -124,11 +116,6 @@ def _scalar(s):
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
         s = s[1:-1]
     return s
-
-
-def doh_host(url):
-    """Hostname out of a DoH URL — what the static A record pinning it is named."""
-    return urllib.parse.urlsplit(url).hostname or ""
 
 
 def dump_yaml(cfg):
@@ -253,8 +240,8 @@ def read_service_list(src):
     stripped). `#` comments are honoured, but only at line start or after
     whitespace, so a raw-URL entry keeps its query/fragment.
 
-    `src` is a URL or a local path. Cached per run: bootstrap/add both consult
-    the same lists and a hosted list must not change under us mid-command.
+    `src` is a URL or a local path. Cached per run: update/add both consult the
+    same lists and a hosted list must not change under us mid-command.
     """
     if src in _SERVICE_LISTS:
         return _SERVICE_LISTS[src]
@@ -448,11 +435,11 @@ def rsc_service(svc, sub, full, cfg, single_scope=True):
       is O(N^2) on the router but only runs when `scp` is unavailable.
     """
     L = cfg["list"]
-    # Per-domain upstream: these names — and only these — are resolved through the
-    # forwarder whose traffic rsc_bootstrap routes into the tunnel, so the answers
-    # come back from the exit node's vantage point. Everything else keeps using the
-    # global DoH server straight out the WAN.
-    fwd = f'forward-to={cfg["doh_forwarder"]} ' if cfg.get("doh_forwarder") else ""
+    # These entries pick no upstream: the router already sends all of its DoH
+    # through the tunnel (fresh-router.rsc pins the resolver into `list`), so a
+    # FWD entry's only job is address-list= — every address a LAN client resolves
+    # under one of these names lands in `list` and gets routed. type=FWD with no
+    # forward-to= resolves through the global use-doh-server, which is what we want.
     # A domain can be in both lists (v2fly `domain:` + `full:` for the same name,
     # e.g. itunes.apple.com). Each name must be added once or the second add
     # fails "entry already exists"; match-subdomain=yes is the superset, so it
@@ -467,7 +454,7 @@ def rsc_service(svc, sub, full, cfg, single_scope=True):
             out += [
                 f':do {{/ip dns static remove [find name="{domain}" type=FWD address-list="{L}"]}} on-error={{}}',
                 f'/ip dns static add name={domain} type=FWD match-subdomain={match_sub} '
-                f'{fwd}address-list={L} comment="{svc}"',
+                f'address-list={L} comment="{svc}"',
                 f':do {{/ip firewall address-list remove [find list="{L}" address="{domain}" dynamic=no]}} on-error={{}}',
                 f':do {{/ip firewall address-list add list={L} address={domain} comment="{svc}"}} on-error={{}}',
             ]
@@ -494,7 +481,7 @@ def rsc_service(svc, sub, full, cfg, single_scope=True):
     for domain, match_sub in domains:
         out += [
             f'/ip dns static add name={domain} type=FWD match-subdomain={match_sub} '
-            f'{fwd}address-list={L} comment="{svc}"',
+            f'address-list={L} comment="{svc}"',
             f':do {{/ip firewall address-list add list={L} address={domain} comment="{svc}"}} on-error={{}}',
         ]
     out.append("}")
@@ -507,145 +494,6 @@ def rsc_remove_service(svc, cfg):
         f'/ip dns static remove [find comment="{svc}" address-list="{L}"]',
         f'/ip firewall address-list remove [find list="{L}" comment="{svc}" dynamic=no]',
     ]
-
-
-def rsc_once(find_expr, add_cmd):
-    """Idempotency idiom: run add_cmd only when find_expr matches nothing."""
-    return f':if ([:len [{find_expr}]] = 0) do={{{add_cmd}}}'
-
-
-def rsc_stale(menu, where, prop, want):
-    """Remove objects matching `where` whose `prop` is not `want`.
-
-    The pins below are keyed by name/comment, so a changed address would otherwise
-    leave the old object sitting next to the new one — and a second A record for a
-    DoH hostname means RouterOS reaches it over whichever path it happens to pick.
-    """
-    return (f':foreach e in=[{menu} find where {where}] '
-            f'do={{:if ([{menu} get $e {prop}] != {want}) do={{{menu} remove $e}}}}')
-
-
-def rsc_doh(cfg):
-    """Split-horizon DoH: only tunneled services resolve through the tunnel.
-
-    A DoH query is TLS on 443, so the firewall cannot tell one name from another —
-    "route only these queries through the VPN" has to become "route this *address*
-    through the VPN". Hence two upstreams that are the same resolver reached at two
-    addresses: the global one pinned to `doh_ip` (straight out the WAN), and the
-    per-service forwarder pinned to `doh_vpn_ip`, which then goes into the VPN
-    address-list — where mtvpn:conn-out / mtvpn:route-out already send router-
-    originated traffic through the tunnel. No extra mangle rule is needed, and the
-    check-gateway=ping fail-open on mtvpn:route covers DNS along with the rest.
-    rsc_service() puts forward-to=<doh_forwarder> on every service entry.
-
-    Both hostnames need a static A record: they are the names DoH itself has to
-    resolve, and nothing can resolve them before DoH is up.
-
-    verify-doh-cert on a forwarder is accepted but stores nil on 7.24.1 — the
-    property is a stub. Certificate verification still happens, inherited from the
-    global /ip dns verify-doh-cert (a forwarder pointed at a hostname outside the
-    server's cert fails with `ssl: name verification failed`). It is passed anyway
-    so the forwarder is right if RouterOS ever implements it.
-    """
-    L, out = cfg["list"], []
-
-    def pin(url, ip, key):
-        """Static A record fixing a DoH hostname to exactly one address."""
-        host = doh_host(url)
-        if not host or not ip:
-            raise SystemExit(f"{key} needs {key}_ip: a DoH server that is not pinned to "
-                             f"one address cannot be kept on one side of the split")
-        return [
-            rsc_stale("/ip dns static", f'name="{host}" type=A', "address", ip),
-            rsc_once(f'/ip dns static find where name="{host}" type=A',
-                     f'/ip dns static add name={host} address={ip} type=A'),
-        ]
-
-    if cfg.get("doh"):
-        out += pin(cfg["doh"], cfg.get("doh_ip"), "doh")
-        out += [
-            # The global resolver's address can land in the VPN list by accident:
-            # any tunneled service that resolves to it puts it there dynamically
-            # (ping2.ui.com is literally 8.8.8.8), and the global path would then
-            # be tunneled too — silently, since it still resolves fine. accept in
-            # mangle means "stop processing this chain", so this rule has to sit
-            # ahead of mtvpn:conn-out; rsc_bootstrap has already added that one by
-            # the time rsc_doh runs. Only chain=output: a LAN client reaching the
-            # same address is a different question, and the service lists own it.
-            rsc_once('/ip firewall mangle find comment="mtvpn:doh-direct"',
-                     f'/ip firewall mangle add chain=output action=accept '
-                     f'dst-address={cfg["doh_ip"]} protocol=tcp dst-port=443 '
-                     f'place-before=[/ip firewall mangle find comment="mtvpn:conn-out"] '
-                     f'comment="mtvpn:doh-direct"'),
-            f'/ip dns set use-doh-server={cfg["doh"]} verify-doh-cert=yes',
-        ]
-    if cfg.get("doh_forwarder") and cfg.get("doh_vpn"):
-        ip = cfg.get("doh_vpn_ip")
-        out += pin(cfg["doh_vpn"], ip, "doh_vpn")
-        out += [
-            # An mtvpn: comment, not a service tag, so neither rsc_remove_service nor
-            # `update --prune` (which work off /ip dns static tags) can sweep the pin.
-            rsc_stale("/ip firewall address-list",
-                      f'list="{L}" comment="mtvpn:doh"', "address", ip),
-            rsc_once(f'/ip firewall address-list find where list="{L}" comment="mtvpn:doh"',
-                     f'/ip firewall address-list add list={L} address={ip} comment="mtvpn:doh"'),
-            rsc_once(f'/ip dns forwarders find where name="{cfg["doh_forwarder"]}"',
-                     f'/ip dns forwarders add name={cfg["doh_forwarder"]} '
-                     f'doh-servers={cfg["doh_vpn"]} verify-doh-cert=yes'),
-        ]
-    return out
-
-
-def rsc_bootstrap(cfg, fix_fasttrack=False):
-    """Idempotent infrastructure: routing table, mangle rules, fail-open VPN route."""
-    L, T, M, lan, gw = cfg["list"], cfg["table"], cfg["mark"], cfg["lan_list"], cfg["gateway"]
-    if not gw:
-        raise SystemExit("bootstrap needs --gateway (next-hop IP of the VPN gateway)")
-
-    out = [
-        rsc_once(f'/routing table find name="{T}"',
-                 f'/routing table add name={T} fib'),
-        # 1-2: mark new connections to listed IPs. in-interface-list=LAN on the
-        # prerouting rule is deliberate: gateway/container-originated traffic must
-        # NOT be marked or it loops back into the gateway.
-        rsc_once(f'/ip firewall mangle find comment="mtvpn:conn-lan"',
-                 f'/ip firewall mangle add chain=prerouting action=mark-connection '
-                 f'connection-mark=no-mark dst-address-list={L} in-interface-list={lan} '
-                 f'new-connection-mark={M} passthrough=yes comment="mtvpn:conn-lan"'),
-        rsc_once(f'/ip firewall mangle find comment="mtvpn:conn-out"',
-                 f'/ip firewall mangle add chain=output action=mark-connection '
-                 f'connection-mark=no-mark dst-address-list={L} '
-                 f'new-connection-mark={M} passthrough=yes comment="mtvpn:conn-out"'),
-        # 3-4: route every packet of a marked connection through the VPN table
-        rsc_once(f'/ip firewall mangle find comment="mtvpn:route-pre"',
-                 f'/ip firewall mangle add chain=prerouting action=mark-routing '
-                 f'connection-mark={M} in-interface-list={lan} '
-                 f'new-routing-mark={T} passthrough=no comment="mtvpn:route-pre"'),
-        rsc_once(f'/ip firewall mangle find comment="mtvpn:route-out"',
-                 f'/ip firewall mangle add chain=output action=mark-routing '
-                 f'connection-mark={M} new-routing-mark={T} passthrough=no comment="mtvpn:route-out"'),
-        # clamp TCP MSS on tunneled flows: VLESS/Reality encapsulation shrinks the
-        # path MTU, so unclamped full-size segments stall. Match by connection-mark
-        # (rides every packet) to clamp both the SYN and SYN-ACK -> both directions.
-        rsc_once(f'/ip firewall mangle find comment="mtvpn:mss-clamp"',
-                 f'/ip firewall mangle add chain=forward action=change-mss '
-                 f'new-mss=1360 passthrough=yes protocol=tcp tcp-flags=syn '
-                 f'connection-mark={M} tcp-mss=1361-65535 comment="mtvpn:mss-clamp"'),
-        # default route via the gateway; check-gateway=ping -> fail-open to main
-        # table (direct WAN) when the gateway is down
-        rsc_once(f'/ip route find where routing-table={T} comment="mtvpn:route"',
-                 f'/ip route add dst-address=0.0.0.0/0 gateway={gw} routing-table={T} '
-                 f'check-gateway=ping comment="mtvpn:route"'),
-    ]
-    out += rsc_doh(cfg)
-    if fix_fasttrack:
-        # fasttrack skips mangle for established connections; exclude marked ones
-        out.append(
-            ':foreach i in=[/ip firewall filter find action=fasttrack-connection] '
-            'do={:do {:if ([:len [:tostr [/ip firewall filter get $i connection-mark]]] = 0) '
-            f'do={{/ip firewall filter set $i connection-mark=!{cfg["mark"]}}}}} on-error={{}}}}'
-        )
-    return out
 
 
 def ssh_base(cfg):
@@ -774,26 +622,6 @@ def query(cfg, command):
         capture_output=True, text=True, timeout=120,
     )
     return [l for l in r.stdout.splitlines() if not SSH_NOISE.search(l)]
-
-
-def cmd_bootstrap(cfg, args):
-    # Infra lines are self-contained, so they serve both transports; only the
-    # per-service blocks differ between the /import and stdin forms.
-    infra = rsc_bootstrap(cfg, fix_fasttrack=args.fix_fasttrack)
-    script, pipe_script = list(infra), list(infra)
-    services = expand_services(cfg)
-    for name in services:
-        svc, url, source, text = resolve_service(name)
-        sub, full, skipped = parse_list(url, text=text)
-        report_parse(svc, sub, full, skipped, source)
-        script += rsc_service(svc, sub, full, cfg)
-        pipe_script += rsc_service(svc, sub, full, cfg, single_scope=False)
-    push(cfg, script, args.dry_run, pipe_script=pipe_script)
-    if not args.dry_run:
-        print(f"bootstrapped {target(cfg)}: infra + {len(services)} service(s)")
-        print("NOTE: LAN clients must use the router as their only DNS server "
-              "(DHCP dns-server, /ip dns allow-remote-requests=yes), or the "
-              "FWD-based subdomain coverage will not populate the list.")
 
 
 def named_services(args):
@@ -1051,11 +879,6 @@ def main():
     ap.add_argument("-n", "--dry-run", action="store_true", help="print RouterOS commands, don't push")
     sp = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sp.add_parser("bootstrap", help="install routing infra + all services from config")
-    p.add_argument("--gateway", help="next-hop IP of the VPN gateway")
-    p.add_argument("--fix-fasttrack", action="store_true",
-                   help="exclude marked connections from existing fasttrack rules")
-
     for c, h in [("add", "fetch service list(s) and install (or refresh) them"),
                  ("update", "re-fetch and refresh services (default: all from config)"),
                  ("remove", "remove service(s) from the router"),
@@ -1090,14 +913,10 @@ def main():
     cfg = load_config(args.config)
     if args.router:
         cfg["ssh"] = args.router
-    if getattr(args, "gateway", None):
-        cfg["gateway"] = args.gateway
     if args.cmd not in ("render", "domains", "search") and not cfg["ssh"] and not args.dry_run:
         raise SystemExit('no router: use -r "ssh <host>" or set "ssh:" in the config file')
 
-    if args.cmd == "bootstrap":
-        cmd_bootstrap(cfg, args)
-    elif args.cmd == "add":
+    if args.cmd == "add":
         cmd_add(cfg, args, args.config)
     elif args.cmd == "update":
         cmd_update(cfg, args, args.config)
