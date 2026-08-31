@@ -1,38 +1,30 @@
-# fresh-router.rsc — bootstrap a fresh MikroTik with selective-VPN routing
+# fresh-router.rsc - bootstrap a fresh MikroTik with selective-VPN routing
 #
 # USAGE
-#   1. Edit the variables in the PARAMETERS section below.
+#   1. Edit the PARAMETERS section below.
 #   2. Complete the PREREQUISITES (manual, once per device).
 #   3. Upload this file and run:  /import fresh-router.rsc
-#   4. From your workstation, add domain services:
-#        ./mtvpn.py -c <router-config>.yaml add anthropic openai youtube ...
+#   4. From your workstation:     ./mtvpn.py -c <router>.yaml add anthropic youtube ...
 #
 # PREREQUISITES (before import)
 #   - Clean config:      /system reset-configuration no-defaults=yes skip-backup=yes
 #   - Container package: /system package print   must list an enabled "container".
-#                        It is an EXTRA package, not part of the routeros bundle:
-#                        download the "Extra packages" archive for this board's
-#                        architecture (RB5009 = arm64), upload container-*.npk,
-#                        /system reboot. Without it the /interface veth and
-#                        /container commands below fail to resolve and RouterOS
-#                        rejects the WHOLE import - the symptom is "nothing
-#                        happened at all, the router has no LAN address".
+#                        It ships in the "Extra packages" archive (RB5009 = arm64),
+#                        not the routeros bundle. Without it RouterOS rejects the
+#                        WHOLE import and the router ends up with no LAN address.
 #   - Device mode:       /system/device-mode/update mode=advanced container=yes scheduler=yes fetch=yes
-#                        Verify with: /system device-mode print
 #   - USB disk:          /disk format usb1 file-system=ext4
 #   - SSH key:           /user ssh-keys import public-key-file=key.pub user=...
 #                        /ip ssh set password-authentication=no
 #   - Disable admin:     /user disable admin
-#
 
 # PARAMETERS
 # LAN /24 prefix (no trailing dot). Router gets .1, DHCP hands out .20-.254
 :local lanNet "10.230.1"
-# WAN port (gets its address via DHCP client)
+# WAN port (gets its address, and the LAN's DNS servers, via DHCP client)
 :local wanIface "ether1"
 # mihomo subscription URL (SUB1 env of the container)
 :local subUrl "https://files....t"
-# container image
 :local image "registry-1.docker.io/wiktorbgu/mihomo-mikrotik:latest"
 :local timeZone "Europe/Moscow"
 
@@ -45,7 +37,7 @@
 :local lanList "LANiface"
 :local wanList "WANiface"
 
-# selective-VPN routing names
+# selective-VPN routing names. $vpnList must match `list:` in mtvpn.yaml.
 :local vpnList "to_vpn_list"
 :local vpnTable "to_vpn_table"
 :local vpnMark "to_vpn_mark"
@@ -54,10 +46,11 @@
 :local containerNet "192.168.89"
 :local vpnGateway ($containerNet . ".2")
 
-# the DoH resolver.
+# DoH resolver for tunneled services only. $dohForwarder must match
+# `doh_forwarder:` in mtvpn.yaml.
 :local dohHost "dns.google"
 :local dohIP "8.8.8.8"
-:local dohUrl ("https://" . $dohHost . "/dns-query")
+:local dohForwarder "vpn-doh"
 
 # PRECHECK device-mode.
 :local containerOk true
@@ -77,115 +70,72 @@
 # bridges & ports
 /interface bridge add name=$lanIface
 /interface bridge add name=$containerIface
-:foreach e in=[/interface ethernet find where name!=$wanIface] do={
+:local lanPorts [/interface ethernet find where name!=$wanIface]
+:foreach e in=$lanPorts do={
     /interface bridge port add bridge=$lanIface interface=[/interface ethernet get $e name]
 }
-
-# Pin the bridge MAC to the first LAN port. With auto-mac=yes (the default) the
-# bridge borrows the MAC of the lowest-numbered *running* port, so it changes
-# whenever ports go up or down and LAN clients have to re-ARP their gateway.
-:local lanPorts [/interface ethernet find where name!=$wanIface]
+# Without this the bridge borrows the MAC of the lowest-numbered *running* port,
+# so it changes as ports go up and down and LAN clients must re-ARP their gateway.
 :if ([:len $lanPorts] > 0) do={
     /interface bridge set [find name=$lanIface] auto-mac=no admin-mac=[/interface ethernet get [:pick $lanPorts 0] mac-address]
 }
-
-# interface lists. The *bridge* is the member, not its ports: for routed traffic
-# the IP firewall sees the bridge as in-interface, so listing the ports instead
-# would match nothing.
 :put "stage: bridges+ports ok"
+
+# Interface lists. The *bridge* is the member, not its ports: for routed traffic
+# the IP firewall sees the bridge as in-interface. The container bridge is
+# deliberately in neither list.
 /interface list add name=$lanList
 /interface list add name=$wanList
 /interface list member add list=$lanList interface=$lanIface
 /interface list member add list=$wanList interface=$wanIface
-# The container bridge is deliberately in neither list: mihomo then cannot reach
-# router services (the input chain drops anything not from LAN), and its egress
-# is never mistaken for LAN traffic by the VPN mangle rules below.
-
-# The container veth is created later, next to the container itself: it is the
-# first command here that can fail on a device without the container package or
-# without device-mode container=yes, and nothing above this point must depend on
-# it. Addressing and DHCP come first so a container failure never costs LAN access.
-
 :put "stage: interface lists ok"
 
-# addressing / DHCP
+# Addressing / DHCP. The veth comes later, next to the container: it is the first
+# command that can fail on a device without the container package, and LAN access
+# must not depend on it.
 /ip address add address=($lanNet . ".1/24") interface=$lanIface
 /ip address add address=($containerNet . ".1/24") interface=$containerIface
 /ip pool add name=dhcp_pool ranges=($lanNet . ".20-" . $lanNet . ".254")
 /ip dhcp-server add address-pool=dhcp_pool interface=$lanIface name=dhcp1 disabled=no
 /ip dhcp-server network add address=($lanNet . ".0/24") gateway=($lanNet . ".1") dns-server=($lanNet . ".1")
-/ip dhcp-client add interface=$wanIface use-peer-dns=no disabled=no
+/ip dhcp-client add interface=$wanIface use-peer-dns=yes disabled=no
 
+# DNS. Two paths: everything resolves via the ISP's DHCP-supplied servers over
+# plain 53 out the WAN (no servers= here - use-peer-dns fills dynamic-servers),
+# while mtvpn's per-domain FWD entries carry forward-to=$dohForwarder and resolve
+# through the tunnel. The static A record pins the resolver to one address so the
+# address-list entry further down can route it, and bootstraps the forwarder
+# itself. verify-doh-cert stays set here: on 7.24.1 the forwarder's own copy of
+# that property stores nil and verification is inherited from the global one.
 /ip dns static add address=$dohIP name=$dohHost type=A
 /ip dns static add address=($lanNet . ".1") name=router.lan type=A
-
-/ip dns set allow-remote-requests=yes use-doh-server=$dohUrl verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
-
+/ip dns forwarders add name=$dohForwarder doh-servers=("https://" . $dohHost . "/dns-query") verify-doh-cert=yes
+/ip dns set allow-remote-requests=yes verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
 :put "stage: addressing/DHCP/DNS ok"
 
-# firewall address lists
 /ip firewall address-list add list=lan_nets address=($lanNet . ".0/24")
-/ip firewall address-list add list=allowed_to_router address=($lanNet . ".0/24")
-/ip firewall address-list add address=0.0.0.0/8 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=172.16.0.0/12 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=192.168.0.0/16 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=10.0.0.0/8 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=169.254.0.0/16 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=127.0.0.0/8 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=224.0.0.0/4 comment=Multicast list=not_in_internet
-/ip firewall address-list add address=198.18.0.0/15 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=192.0.0.0/24 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=192.0.2.0/24 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=198.51.100.0/24 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=203.0.113.0/24 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=100.64.0.0/10 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=240.0.0.0/4 comment=RFC6890 list=not_in_internet
-/ip firewall address-list add address=192.88.99.0/24 comment="6to4 relay Anycast [RFC 3068]" list=not_in_internet
 
-# No /ip firewall raw rules on purpose. MikroTik's "Building Advanced Firewall"
-# puts a bad_tcp flag-validation chain here, but raw sits ahead of connection
-# tracking in the packet flow, so every rule in it is evaluated on every packet
-# — including FastTracked ones, which bypass the filter chain but not raw. That
-# put ~9 evaluations per TCP packet on the hot path to block malformed-flag
-# scans that the input default-deny and the forward !dstnat rule already drop.
-# To measure before re-adding: /ip firewall raw print stats during a large
-# download — if a raw rule's counter climbs at line rate, raw is on the fast path.
+# No /ip firewall raw rules on purpose: raw sits ahead of connection tracking, so
+# every rule there is evaluated on every packet, FastTracked ones included.
 
-# firewall filter
-# input is default-deny: the filter policy is accept, so without the final drop
-# anything that is not explicitly matched reaches the router — the container
-# bridge today, any tunnel or VLAN added later. A new WireGuard/Tailscale
-# interface must join $lanList (or get its own accept) or its input is dropped.
+# firewall filter. input is default-deny, so a tunnel or VLAN added later must
+# join $lanList (or get its own accept) or its input is dropped.
 /ip firewall filter add action=accept chain=input comment="established, related, untracked" connection-state=established,related,untracked
 /ip firewall filter add action=drop chain=input comment="drop invalid" connection-state=invalid
-# in-interface-list= as well as src-address-list=: without it a WAN packet
-# spoofing a LAN source address would be accepted by the router.
-/ip firewall filter add action=accept chain=input comment="trusted LAN sources" in-interface-list=$lanList src-address-list=allowed_to_router
-# No DHCP accept rule is needed here even though a DISCOVER has src 0.0.0.0 and
-# therefore misses allowed_to_router above: RouterOS handles DHCP before the
-# filter chain. Measured on a live hEX S — an explicit accept rule sat at 0
-# packets while 13 clients renewed 30-minute leases, so DHCP never reaches this
-# chain at all. (The stock MikroTik config is the other half of the proof: it
-# drops the WAN interface outright yet its DHCP client still gets a lease.)
-# rate-limited: this rule (not the icmp chain below) is what answers pings to the
-# router itself. LAN pings never reach it — they are already accepted by the rule
-# above — so the limit only throttles ICMP arriving from elsewhere, and
-# over-limit packets fall through to the default deny.
+# in-interface-list= as well as src-address-list=, else a WAN packet spoofing a
+# LAN source address would be accepted. DHCP needs no rule: RouterOS handles it
+# before the filter chain.
+/ip firewall filter add action=accept chain=input comment="trusted LAN sources" in-interface-list=$lanList src-address-list=lan_nets
 /ip firewall filter add action=accept chain=input comment="allow ping to the router" limit=5,10:packet protocol=icmp
 /ip firewall filter add action=drop chain=input comment="default deny: anything not accepted above"
 /ip firewall filter add action=fasttrack-connection chain=forward comment="FastTrack (skips VPN-marked)" connection-mark=no-mark connection-state=established,related
 /ip firewall filter add action=accept chain=forward comment="Established, Related, Untracked" connection-state=established,related,untracked
-# These four drops deliberately do NOT log. "invalid" and "!NAT" fire constantly
-# from background internet scanning, and a log write per dropped packet turns a
-# scan into a self-inflicted CPU load — the more junk arrives, the more work the
-# router does. Add log=yes log-prefix=<x> back temporarily when debugging.
+# These drops deliberately do NOT log: internet background scanning fires them
+# constantly, and a log write per packet turns a scan into self-inflicted load.
 /ip firewall filter add action=drop chain=forward comment="Drop invalid" connection-state=invalid
 /ip firewall filter add action=drop chain=forward comment="Drop incoming packets that are not NAT`ted" connection-nat-state=!dstnat connection-state=new in-interface-list=$wanList
 /ip firewall filter add action=jump chain=forward comment="jump to ICMP filters" jump-target=icmp protocol=icmp
-/ip firewall filter add action=drop chain=forward comment="Drop incoming from internet which is not public IP" in-interface-list=$wanList src-address-list=not_in_internet
 /ip firewall filter add action=drop chain=forward comment="Drop packets from LAN that do not have LAN IP" in-interface-list=$lanList src-address-list=!lan_nets
-# forwarded ICMP only (reached via the jump above). Echo request/reply are
-# rate-limited; over-limit packets fall through to the final drop in this chain.
 /ip firewall filter add action=accept chain=icmp comment="echo reply" icmp-options=0:0 limit=5,10:packet protocol=icmp
 /ip firewall filter add action=accept chain=icmp comment="net unreachable" icmp-options=3:0 protocol=icmp
 /ip firewall filter add action=accept chain=icmp comment="host unreachable" icmp-options=3:1 protocol=icmp
@@ -195,9 +145,7 @@
 /ip firewall filter add action=accept chain=icmp comment="allow parameter bad" icmp-options=12:0 protocol=icmp
 /ip firewall filter add action=drop chain=icmp comment="deny all other types"
 
-# NAT
 /ip firewall nat add action=masquerade chain=srcnat comment="Masquerade LAN -> WAN" out-interface-list=$wanList
-
 :put "stage: firewall ok"
 
 # selective-VPN routing infrastructure (mtvpn-compatible comments)
@@ -206,49 +154,47 @@
 /ip firewall mangle add chain=output action=mark-connection connection-mark=no-mark dst-address-list=$vpnList new-connection-mark=$vpnMark passthrough=yes comment="mtvpn:conn-out"
 /ip firewall mangle add chain=prerouting action=mark-routing connection-mark=$vpnMark in-interface-list=$lanList new-routing-mark=$vpnTable passthrough=no comment="mtvpn:route-pre"
 /ip firewall mangle add chain=output action=mark-routing connection-mark=$vpnMark new-routing-mark=$vpnTable passthrough=no comment="mtvpn:route-out"
-# clamp TCP MSS on tunneled flows: VLESS/Reality encapsulation shrinks the path
-# MTU, so unclamped full-size segments stall ("some sites hang over VPN"). Match
-# by connection-mark (rides every packet) so both the SYN and SYN-ACK are clamped
-# -> both directions covered, no dependence on the container interface name.
+# VLESS/Reality encapsulation shrinks the path MTU, so unclamped full-size
+# segments stall. Match by connection-mark so SYN and SYN-ACK are both clamped.
 /ip firewall mangle add chain=forward action=change-mss new-mss=1360 passthrough=yes protocol=tcp tcp-flags=syn connection-mark=$vpnMark tcp-mss=1361-65535 comment="mtvpn:mss-clamp"
+# An inactive route in a marked table is a lookup miss, and a miss falls back to
+# main - so a dead gateway fails open to the WAN.
 /ip route add dst-address=0.0.0.0/0 gateway=$vpnGateway routing-table=$vpnTable check-gateway=ping comment="mtvpn:route"
-# the DoH resolver, so every query the router makes rides mtvpn:conn-out /
-# mtvpn:route-out into the tunnel. By hostname, not by address: RouterOS refuses a
-# static entry duplicating a dynamic one in the same list, and this address gets
-# there dynamically all by itself - ping2.ui.com, in the ubiquiti list, *is*
-# 8.8.8.8. A hostname entry merges into that dynamic entry instead of colliding
-# with it, and the static A record above is what resolves it before DoH is up.
-# An mtvpn: comment rather than a service tag, so `mtvpn remove` /
-# `mtvpn update --prune` can never sweep the pin away.
-/ip firewall address-list add list=$vpnList address=$dohHost comment="mtvpn:doh"
 
-# container + its veth + its watchdog. One :do block: each of these depends on the
-# previous one, and the usual failures (no container package, device-mode not
-# confirmed, usb1 not formatted) all surface here. on-error keeps the import going
-# so the rest of the router is still configured and reachable.
+# Two hosts the router itself must reach through the tunnel: the DoH resolver and
+# the Telegram CIDR source. mtvpn:conn-out / mtvpn:route-out do the routing.
+# By hostname, not address: RouterOS refuses a static address-list entry that
+# duplicates a dynamic one in the same list, and 8.8.8.8 lands there dynamically
+# on its own (ping2.ui.com, in the v2fly ubiquiti list, *is* 8.8.8.8) - a
+# hostname entry merges into it instead of colliding. The mtvpn: comment is what
+# keeps `mtvpn remove` and `update --prune` off them; the FWD entry carries no
+# address-list= for the same reason.
+/ip firewall address-list add list=$vpnList address=$dohHost comment="mtvpn:doh"
+/ip dns static add name=core.telegram.org type=FWD forward-to=$dohForwarder comment="mtvpn:tg-fetch"
+/ip firewall address-list add list=$vpnList address=core.telegram.org comment="mtvpn:tg-fetch"
+
+# container + veth + watchdogs. One :do block: each step depends on the previous,
+# and the usual failures (no container package, device-mode unconfirmed, usb1 not
+# formatted) all surface here. on-error keeps the import going.
 :if ($containerOk) do={
     :do {
-        # veth on the container bridge; .2 is the VPN gateway the routes point at
         /interface veth add name=$vethName address=($containerNet . ".2/24") gateway=($containerNet . ".1")
         /interface bridge port add bridge=$containerIface interface=$vethName
         /container config set registry-url=https://registry-1.docker.io tmpdir=usb1/container-tmp layer-dir=usb1/container-tmp/layer
         /container envs add key=SUB1 list=mihomo value=$subUrl
         /container add remote-image=$image interface=$vethName envlists=mihomo dns=8.8.8.8,8.8.4.4 root-dir=usb1/container-tmp/docker/mihomo start-on-boot=yes
-        # two watchdogs, because the two ways this breaks look different here.
+        :local restart "/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted: "
         # 1. container down: the veth stops answering. Probe the gateway itself -
-        #    the VPN route has gone inactive by then and everything else fails
-        #    open to the WAN, so a probe aimed further out would be answered
-        #    directly and hide the outage.
-        /tool netwatch add host=$vpnGateway interval=1m timeout=2s type=simple comment="mtvpn:watch-gw" down-script="/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted (gateway down)\""
+        #    by then the VPN route is inactive and everything else fails open, so
+        #    a probe aimed further out would be answered directly.
+        /tool netwatch add host=$vpnGateway interval=1m timeout=2s type=simple comment="mtvpn:watch-gw" down-script=($restart . "gateway down\"")
         # 2. container up, tunnel dead: mihomo answers ping but forwards nothing,
-        #    so check-gateway sees a live gateway and the route stays active.
-        #    $dohIP:443 is in $vpnList (pinned above), so this probe rides
-        #    mtvpn:conn-out through the tunnel and fails on exactly the address
-        #    and port DoH uses. tcp-conn, not simple: ICMP can survive a proxy
-        #    whose TCP outbound is dead. 3m, not 1m: a restarted mihomo needs
-        #    time to fetch its subscription and connect, and a 1m probe would
-        #    restart it again before it ever converged.
-        /tool netwatch add host=$dohIP port=443 interval=3m timeout=5s type=tcp-conn comment="mtvpn:watch-tunnel" down-script="/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted (tunnel dead)\""
+        #    so check-gateway keeps the route active. $dohIP:443 is pinned into
+        #    $vpnList above, so this probe rides the tunnel and fails on exactly
+        #    the address and port DoH uses. tcp-conn, not simple: ICMP can survive
+        #    a proxy whose TCP outbound is dead. 3m, not 1m: a restarted mihomo
+        #    needs time to fetch its subscription before being probed again.
+        /tool netwatch add host=$dohIP port=443 interval=3m timeout=5s type=tcp-conn comment="mtvpn:watch-tunnel" down-script=($restart . "tunnel dead\"")
         :put "container: ok"
     } on-error={
         :put "!! container setup FAILED - check: /system package print (container installed?),"
@@ -269,134 +215,85 @@
 /ip service set www disabled=yes
 /ip service set api disabled=yes
 /ip service set api-ssl disabled=yes
-
 /tool graphing resource add store-on-disk=yes
 
-# Telegram IP ranges updater (domain lists don't cover TG's raw-IP clients)
+# Telegram IPv4 ranges (domain lists don't cover TG's raw-IP clients). The fetch
+# rides the tunnel because core.telegram.org is pinned into $vpnList above. The
+# tag is NOT "telegram": mtvpn tags its telegram service comment=telegram and the
+# commit step below wipes the whole tag before re-adding.
 /system scheduler add interval=6h name=Update_Telegram_IPs on-event="/system script run Update_Telegram_CIDR" policy=read,write,policy,test start-time=startup
-/system script
-add dont-require-permissions=no name=Update_Telegram_CIDR owner=tikhon \
+/system script add dont-require-permissions=no name=Update_Telegram_CIDR \
     policy=read,write,policy,test source=("\
-    \n#  Update_Telegram_CIDR  -  fail-safe rewrite\
-    \n#  Refreshes Telegram IPv4 CIDRs in to_vpn_list.\
-    \n#  Never empties the list on failure. Always cleans up.\
-    \n\
-    \n:local url         \"https://core.telegram.org/resources/cidr.txt\"\
-    \n:local resolveHost \"core.telegram.org\"\
-    \n:local listName    \"" . $vpnList . "\"\
-    \n# NOT \"telegram\": mtvpn tags its telegram service entries comment=telegram,\
-    \n# and step 4 below removes the whole tag before re-adding. A shared tag makes\
-    \n# the two wipe each other's entries.\
-    \n:local tag         \"telegram-cidr\"\
-    \n:local altGateway  \"" . $vpnGateway . "\"\
-    \n:local routeTag    \"TEMP_TG_FETCH\"\
-    \n:local minEntries  5\
-    \n\
+    \n:local url  \"https://core.telegram.org/resources/cidr.txt\"\
+    \n:local listName \"" . $vpnList . "\"\
+    \n:local tag \"telegram-cidr\"\
+    \n:local minEntries 5\
     \n:local content \"\"\
     \n:local newNets [:toarray \"\"]\
-    \n:local tgIP \"\"\
-    \n\
     \n:log info \"TG CIDR: start\"\
     \n\
-    \n# 0. clear leftovers from any previous crashed run\
-    \n/ip route remove [find comment=\$routeTag]\
-    \n\
-    \n# 1. temporary route so the fetch itself goes via the tunnel\
+    \n# download straight into memory (no file, no USB writes)\
     \n:do {\
-    \n    :set tgIP [:resolve \$resolveHost]\
-    \n} on-error={\
-    \n    :log warning \"TG CIDR: resolve failed\"\
-    \n}\
-    \n:if ([:len \$tgIP] > 0) do={\
-    \n    :do {\
-    \n        /ip route add dst-address=\"\$tgIP/32\" gateway=\$altGateway com\
-    ment=\$routeTag\
-    \n        :delay 2s\
-    \n    } on-error={\
-    \n        :log warning \"TG CIDR: temp route not added\"\
-    \n    }\
-    \n}\
-    \n\
-    \n# 2. download straight into memory (no file, no USB writes)\
-    \n:do {\
-    \n    :local res [/tool fetch url=\$url output=user as-value check-certifi\
-    cate=no]\
-    \n    :if ((\$res->\"status\") = \"finished\") do={\
-    \n        :set content (\$res->\"data\")\
-    \n    }\
+    \n    :local res [/tool fetch url=\$url output=user as-value check-certificate=no]\
+    \n    :if ((\$res->\"status\") = \"finished\") do={ :set content (\$res->\"data\") }\
     \n} on-error={\
     \n    :log error \"TG CIDR: download failed\"\
     \n}\
     \n\
-    \n# 3. parse: accept IPv4 CIDR lines only\
+    \n# parse: accept IPv4 CIDR lines only\
     \n:local total [:len \$content]\
     \n:local start 0\
     \n:while (\$start < \$total) do={\
     \n    :local end [:find \$content \"\\n\" \$start]\
     \n    :if ([:typeof \$end] = \"nil\") do={ :set end \$total }\
-    \n\
     \n    :local line [:pick \$content \$start \$end]\
-    \n\
     \n    :do {\
-    \n        :if ([:len \$line] > 0) do={\
-    \n            :if ([:pick \$line ([:len \$line] - 1) [:len \$line]] = \"\\\
-    r\") do={\
-    \n                :set line [:pick \$line 0 ([:len \$line] - 1)]\
-    \n            }\
+    \n        :if ([:len \$line] > 0 && [:pick \$line ([:len \$line] - 1) [:len \$line]] = \"\\r\") do={\
+    \n            :set line [:pick \$line 0 ([:len \$line] - 1)]\
     \n        }\
     \n        :while ([:len \$line] > 0 && [:pick \$line 0 1] = \" \") do={\
     \n            :set line [:pick \$line 1 [:len \$line]]\
     \n        }\
-    \n        :while ([:len \$line] > 0 && [:pick \$line ([:len \$line] - 1) [\
-    :len \$line]] = \" \") do={\
+    \n        :while ([:len \$line] > 0 && [:pick \$line ([:len \$line] - 1) [:len \$line]] = \" \") do={\
     \n            :set line [:pick \$line 0 ([:len \$line] - 1)]\
     \n        }\
-    \n\
     \n        :local slash [:find \$line \"/\"]\
     \n        :if ([:len \$line] > 0 && [:typeof \$slash] != \"nil\") do={\
-    \n            :local ipVal   [:toip [:pick \$line 0 \$slash]]\
-    \n            :local maskVal [:tonum [:pick \$line (\$slash + 1) [:len \$l\
-    ine]]]\
-    \n            :if ([:typeof \$ipVal] = \"ip\" && [:typeof \$maskVal] = \"n\
-    um\" && \$maskVal >= 0 && \$maskVal <= 32) do={\
+    \n            :local ipVal [:toip [:pick \$line 0 \$slash]]\
+    \n            :local maskVal [:tonum [:pick \$line (\$slash + 1) [:len \$line]]]\
+    \n            :if ([:typeof \$ipVal] = \"ip\" && [:typeof \$maskVal] = \"num\" && \$maskVal >= 0 && \$maskVal <= 32) do={\
     \n                :set newNets (\$newNets , \$line)\
     \n            }\
     \n        }\
     \n    } on-error={}\
-    \n\
     \n    :set start (\$end + 1)\
     \n}\
     \n\
-    \n# 4. commit only if the result looks sane\
+    \n# commit only if the result looks sane - never empty the list on failure\
     \n:local count [:len \$newNets]\
     \n:if (\$count >= \$minEntries) do={\
-    \n    /ip firewall address-list remove [find list=\$listName comment=\$tag\
-    ]\
+    \n    /ip firewall address-list remove [find list=\$listName comment=\$tag]\
     \n    :local added 0\
     \n    :foreach net in=\$newNets do={\
     \n        :do {\
-    \n            /ip firewall address-list add list=\$listName address=\$net \
-    comment=\$tag\
+    \n            /ip firewall address-list add list=\$listName address=\$net comment=\$tag\
     \n            :set added (\$added + 1)\
     \n        } on-error={\
     \n            :log warning (\"TG CIDR: could not add \" . \$net)\
     \n        }\
     \n    }\
-    \n    :log info (\"TG CIDR: updated - \" . \$added . \" of \" . \$count . \
-    \" IPv4 subnets active\")\
+    \n    :log info (\"TG CIDR: updated - \" . \$added . \" of \" . \$count . \" IPv4 subnets active\")\
     \n} else={\
-    \n    :log error (\"TG CIDR: only \" . \$count . \" subnets parsed (need >\
-    = \" . \$minEntries . \") - existing list left untouched\")\
+    \n    :log error (\"TG CIDR: only \" . \$count . \" subnets parsed (need >= \" . \$minEntries . \") - list left untouched\")\
     \n}\
-    \n\
-    \n# 5. cleanup - always reached\
-    \n/ip route remove [find comment=\$routeTag]\
     \n:log info \"TG CIDR: finished\"")
 
 /ip neighbor discovery-settings set discover-interface-list=$lanList
 /tool mac-server set allowed-interface-list=$lanList
 /tool mac-server mac-winbox set allowed-interface-list=$lanList
 
+# IPv4-only selective routing: a dual-stack client would otherwise reach an
+# AAAA-capable service direct over the WAN. Takes effect on reboot.
 :do { /ipv6 settings set disable-ipv6=yes } on-error={}
 
 :put "fresh-router: import finished"

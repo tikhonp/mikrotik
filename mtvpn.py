@@ -1,35 +1,17 @@
 #!/usr/bin/env python3
 """mtvpn — manage the selective-VPN domain list on MikroTik RouterOS 7.
 
-mtvpn owns exactly one thing: what is in the firewall address-list (default:
-to_vpn_list). The routing that acts on that list — mangle marks, routing table,
-fail-open default route, tunneled DoH — is the router's own config, installed
-once by fresh-router.rsc and never touched from here.
+mtvpn owns one thing: what is in the firewall address-list (default to_vpn_list).
+The routing that acts on it — mangle marks, routing table, fail-open default
+route, the DoH forwarder — is installed once by fresh-router.rsc.
 
-Domains land in the list by two mechanisms:
-  1. DNS static FWD entries with match-subdomain=yes  -> covers every subdomain
-     a LAN client resolves (dynamic list entries, renewed on each query)
-  2. firewall address-list hostname entries           -> apex A records,
-     continuously re-resolved by the firewall, survive DNS cache flushes
+Per domain it writes two objects: an /ip dns static FWD entry (match-subdomain,
+address-list=, forward-to=<doh_forwarder> so the name resolves through the
+tunnel) and an /ip firewall address-list hostname entry for the apex.
 
-Domain sources, named explicitly per service and never inferred:
-  - iplist:<selector>   iplist.opencck.org, e.g. iplist:youtube.com (a site) or
-                        iplist:apple (a group). iplist:<portal>:<selector> pins
-                        the portal.
-  - v2fly:<name>        v2fly/domain-list-community, e.g. v2fly:anthropic. A bare
-                        name means this — what it meant before iplist existed.
-  - a raw URL to a file in either format — including a plain one-domain-per-line
-    list of your own, `#` comments and all. `<tag>=<url>` names it; otherwise the
-    tag comes from the URL. `update --urls-only` refreshes just these.
-A selector that one source doesn't carry is an error, not a silent switch to the
-other; `search` lists what both have.
-
-The set of services itself can also live on a server: a hosted *service list* is
-one selector per line, referenced by the config's `service_lists:` or by
---from-list, and `update` then applies whatever it says today (--prune to also
-drop what it stopped saying).
-
-Requires: python3 (stdlib only) and ssh key auth to the router.
+Sources are named explicitly and never inferred: iplist:<site|group>,
+v2fly:<name>, a raw URL, or a bare name (= v2fly:). Requires python3 and ssh
+key auth to the router.
 """
 
 import argparse
@@ -48,9 +30,7 @@ from pathlib import Path
 V2FLY_BASE = "https://raw.githubusercontent.com/v2fly/domain-list-community/refs/heads/master/data/"
 V2FLY_TREE_API = "https://api.github.com/repos/v2fly/domain-list-community/git/trees/"
 
-# iplist.opencck.org portals, probed in this order. Their catalogs are near-disjoint
-# (only ui.com and anydesk.com appear on two), so the order rarely decides anything;
-# iplist:<portal>:<selector> pins it for the cases where it does.
+# Near-disjoint catalogs, probed in this order; iplist:<portal>:<selector> pins one.
 IPLIST_PORTALS = [
     ("main", "https://iplist.opencck.org/"),
     ("beta", "https://beta.iplist.opencck.org/"),
@@ -58,39 +38,32 @@ IPLIST_PORTALS = [
 ]
 SOURCES = ("iplist", "v2fly")
 
-# `<tag>=<url>`: `=` separates only when a bare tag precedes it and a URL scheme
-# follows, so a plain URL carrying a query string is never split.
+# `<tag>=<url>`: only splits when a bare tag precedes a URL scheme, so a plain
+# URL carrying a query string is never split.
 NAMED_URL_RE = re.compile(r"^([a-z0-9][a-z0-9._-]*)=(?=[a-z][a-z0-9+.-]*://)", re.I)
-# Extensions dropped when deriving a tag from a URL: a custom list is usually
-# served as a file, and "domains.txt" makes a poor router comment.
 TAG_EXTENSIONS = (".txt", ".list", ".lst", ".dat", ".conf", ".md")
 
 DEFAULTS = {
     "ssh": "",                # full ssh command, e.g. "ssh -J jumphost 10.0.0.1"
-    "scp": "",                # optional scp template override with {local}/{remote}
-                              # placeholders; derived from ssh when empty
-    # The firewall address-list the router already routes through the tunnel —
-    # fresh-router.rsc creates it along with the mangle rules, routing table and
-    # DoH pin that act on it. This is the only router-side name mtvpn needs: it
-    # fills the list and nothing else.
-    "list": "to_vpn_list",
-    # Seconds to wait for a push. A full refresh writes ~2 objects per domain,
-    # so a few thousand domains on a slow board runs for minutes — and a client-
-    # side timeout kills the ssh session, which aborts /import partway and can
-    # leave a service with its old entries removed and the new ones not yet added.
-    # Generous by design: the transport is one-shot bulk work, not a health check.
+    "scp": "",                # optional scp override, {local}/{remote} placeholders
+    "list": "to_vpn_list",    # address-list the router tunnels; from fresh-router.rsc
+    "doh_forwarder": "vpn-doh",  # /ip dns forwarders name; from fresh-router.rsc
+    # A full refresh writes ~2 objects per domain; a client-side timeout would
+    # abort /import partway and leave a service half-removed.
     "push_timeout": 1800,
-    "service_lists": [],      # URLs/paths of hosted service lists (see read_service_list)
+    "service_lists": [],
     "services": [],
 }
 
 SSH_NOISE = re.compile(r"WARNING|post-quantum|store now|upgraded|^\s*$")
 DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
 
+SERVICES_HELP = ("iplist:<site|group>, v2fly:<name>, or a raw URL of a domain list, "
+                 "optionally named <tag>=<url> (a bare name means v2fly:)")
+
 
 def parse_yaml(text):
-    """Minimal YAML subset: flat `key: value` scalars plus one-level lists of
-    scalars (`- item`). Full-line comments only. Enough for mtvpn configs."""
+    """Flat `key: value` scalars plus one-level `- item` lists. Full-line comments only."""
     data, last = {}, None
     for raw in text.splitlines():
         stripped = raw.strip()
@@ -134,12 +107,10 @@ def load_config(path):
     p = Path(path)
     if p.exists():
         cfg.update(parse_yaml(p.read_text()))
-    if not cfg.get("ssh") and cfg.get("router"):  # legacy router/ssh_opts keys
-        cfg["ssh"] = " ".join(["ssh"] + cfg.pop("ssh_opts", []) + [cfg.pop("router")])
     for key in ("services", "service_lists"):  # an empty "key:" line parses as ""
         if isinstance(cfg.get(key), str):
             cfg[key] = [cfg[key]] if cfg[key] else []
-    try:  # parse_yaml yields strings; every use of this one is a number
+    try:
         cfg["push_timeout"] = int(cfg["push_timeout"])
     except (TypeError, ValueError):
         raise SystemExit(f"config: push_timeout must be a number, got {cfg['push_timeout']!r}")
@@ -151,12 +122,7 @@ def save_config(path, cfg):
 
 
 def split_named_url(name):
-    """Split the optional `<tag>=<url>` form. Returns (tag or None, rest).
-
-    A custom domain list has no upstream name to borrow, so its tag would otherwise
-    be whatever the URL's last path segment happens to be — which two lists on
-    different hosts can easily share, silently merging them under one comment.
-    """
+    """Split the optional `<tag>=<url>` form into (tag or None, rest)."""
     m = NAMED_URL_RE.match(name)
     return (m.group(1).lower(), name[m.end():]) if m else (None, name)
 
@@ -164,10 +130,7 @@ def split_named_url(name):
 def parse_selector(name):
     """Split a config entry into (source, portal, selector).
 
-    source is "iplist", "v2fly", "url", or None for a bare name — which every
-    command that must pick one treats as v2fly, the source bare names meant before
-    iplist existed. portal is set only by the iplist:<portal>:<selector> form.
-    For a URL the selector is the URL itself, with any `<tag>=` prefix stripped.
+    source is "iplist", "v2fly", "url", or None for a bare name (treated as v2fly).
     """
     name = split_named_url(name.strip())[1]
     if "://" in name:
@@ -181,8 +144,6 @@ def parse_selector(name):
     portal, sep2, rest2 = rest.partition(":")
     if not sep2:
         return "iplist", None, rest
-    # Three parts can only be iplist:<portal>:<selector> — no site or group name
-    # contains a colon — so an unrecognised middle is a typo, not a selector.
     if portal not in {p for p, _ in IPLIST_PORTALS}:
         raise SystemExit(f"unknown iplist portal {portal!r}: expected one of "
                          f"{', '.join(p for p, _ in IPLIST_PORTALS)}")
@@ -192,24 +153,21 @@ def parse_selector(name):
 def service_tag(name):
     """Router comment tag for a config entry: its selector, minus the source prefix.
 
-    Network-free by contract — `remove` and the services bookkeeping in add/remove
-    must not need a fetch to know which entries a name owns. Dropping the prefix is
-    also what keeps v2fly:youtube pointed at the comment=youtube entries an older
-    mtvpn.yaml already installed.
+    Network-free by contract, and the unit everything dedupes by: `add anthropic`
+    must not append a second entry beside an existing v2fly:anthropic.
     """
     src, _, sel = parse_selector(name)
     if src != "url":
         return sel
     tag, _ = split_named_url(name.strip())
-    if tag:  # <tag>=<url> says outright what the entry is called
+    if tag:
         return tag
     q = urllib.parse.parse_qs(urllib.parse.urlparse(sel).query)
     for kind in ("site", "group"):  # an iplist URL carries its selector in the query
         if q.get(kind):
             return q[kind][0].lower()
     parts = urllib.parse.urlparse(sel)
-    # Never fall through to "": the empty tag is what untagged/adopted entries carry,
-    # so an entry named "" would own every one of them.
+    # Never fall through to "": the empty tag is what adopted entries carry.
     leaf = (parts.path.rstrip("/").rsplit("/", 1)[-1] or parts.netloc).lower()
     for ext in TAG_EXTENSIONS:
         if leaf.endswith(ext) and len(leaf) > len(ext):
@@ -232,16 +190,11 @@ _SERVICE_LISTS: dict = {}
 
 
 def read_service_list(src):
-    """Read a hosted list of *service selectors* (not domains): one per line.
+    """Read a hosted list of service *selectors* (not domains), one per line.
 
-    The point is keeping the set of tunneled services on a server instead of in
-    every router's mtvpn.yaml — the file holds exactly what `services:` would
-    hold, so a `services:` block can be pasted in verbatim (a leading "- " is
-    stripped). `#` comments are honoured, but only at line start or after
-    whitespace, so a raw-URL entry keeps its query/fragment.
-
-    `src` is a URL or a local path. Cached per run: update/add both consult the
-    same lists and a hosted list must not change under us mid-command.
+    A `services:` block pastes in verbatim: a leading "- " is stripped. `#`
+    comments only at line start or after whitespace, so raw-URL entries survive.
+    Cached per run — a hosted list must not change mid-command.
     """
     if src in _SERVICE_LISTS:
         return _SERVICE_LISTS[src]
@@ -254,7 +207,7 @@ def read_service_list(src):
         line = re.split(r"\s#", raw.strip(), maxsplit=1)[0].strip()
         if not line or line.startswith("#"):
             continue
-        if line.startswith("- "):  # a pasted YAML services: block
+        if line.startswith("- "):
             line = line[2:].strip()
         if not line or line.endswith(":"):  # e.g. the "services:" key itself
             continue
@@ -268,12 +221,7 @@ def read_service_list(src):
 
 
 def expand_services(cfg, extra_lists=()):
-    """The effective service set: cfg["services"] plus every hosted list's entries.
-
-    Deduped by service_tag, so a service named in both the config and a list is
-    installed once and the config's spelling wins — that spelling is the one
-    `remove` and the config bookkeeping already match on.
-    """
+    """cfg["services"] plus every hosted list's entries; the config spelling wins."""
     names, seen = [], set()
     for name in (list(cfg["services"])
                  + [n for src in list(cfg.get("service_lists") or []) + list(extra_lists)
@@ -288,9 +236,9 @@ def expand_services(cfg, extra_lists=()):
 def iplist_url(base, kind, selector):
     """Query URL for one iplist selector; `kind` is "site" or "group".
 
-    wildcard=1 is not optional: wildcard=0 returns every hostname the service has
-    ever been seen to use (15k+ for youtube), while the wildcard set is the apex
-    list whose meaning matches RouterOS match-subdomain=yes exactly.
+    wildcard=1 is not optional: wildcard=0 returns every hostname ever observed
+    (15k+ for youtube), while the wildcard set is the apex list, which is exactly
+    what RouterOS match-subdomain=yes means.
     """
     return base + "?" + urllib.parse.urlencode(
         {"format": "text", "data": "domains", "wildcard": "1", kind: selector})
@@ -299,22 +247,18 @@ def iplist_url(base, kind, selector):
 def iplist_find(selector, portal=None):
     """Locate an iplist selector. Returns (source_label, url, text) or None.
 
-    A selector is either a site (youtube.com, apple@icloud.com, copilot) or a group
-    (apple, ai, youtube). The two never collide, but the shape doesn't tell them
-    apart either — the main portal has dotless sites — so both are probed.
-
-    A portal that doesn't carry the selector answers 200 with an empty body rather
-    than 404, so emptiness is the only "not here" signal there is. Which also means
-    an unreachable portal must not read as a miss: those are reported separately.
+    A portal without the selector answers 200 with an empty body, not 404, so
+    emptiness is the only miss signal — which means an unreachable portal must
+    not read as a miss.
     """
     for name, base in [(p, b) for p, b in IPLIST_PORTALS if portal in (None, p)]:
-        for kind in ("site", "group"):
+        for kind in ("site", "group"):  # shape doesn't tell them apart: sites can be dotless
             url = iplist_url(base, kind, selector)
             try:
                 text = fetch(url)
-            except OSError as e:  # URLError/timeouts both land here
+            except OSError as e:
                 print(f"# iplist portal {name} unreachable: {e}", file=sys.stderr)
-                break  # don't retry the other kind against a dead portal
+                break
             if text.strip():
                 return f"iplist {name} {kind}", url, text
     return None
@@ -323,10 +267,8 @@ def iplist_find(selector, portal=None):
 def resolve_service(name):
     """Map a config entry to (tag, url, source_label, text).
 
-    `text` is the already-fetched body when resolution had to download it to find
-    out whether the selector exists at all, else None. Sources are never inferred:
-    a selector no iplist portal carries is an error, not a quiet fall back to
-    v2fly — the other source is one prefix away.
+    `text` is the already-fetched body when resolution had to download it to
+    learn whether the selector exists, else None.
     """
     src, portal, sel = parse_selector(name)
     tag = service_tag(name)
@@ -344,12 +286,7 @@ def resolve_service(name):
 
 
 def service_variants(name):
-    """Every (tag, url, source_label, text) a name could install.
-
-    An explicitly sourced name or a URL resolves to exactly one. A bare name is
-    looked up in both sources, so `domains <name>` can show what each would give
-    before one of them is written into the config.
-    """
+    """Every (tag, url, source_label, text) a name could install: a bare name has one per source."""
     src, _, sel = parse_selector(name)
     if src is not None:
         return [resolve_service(name)]
@@ -368,17 +305,12 @@ def service_variants(name):
 
 
 def parse_list(url, seen=None, text=None):
-    """Parse a domain list. Returns (subdomain_domains, exact_domains, skipped).
+    """Parse a domain list into (subdomain_domains, exact_domains, skipped).
 
-    Handles: plain domains (match subdomains), full:, domain:, include: (recursive).
-    Skips regexp:/keyword: rules — RouterOS cannot express them. iplist's output is
-    a subset of this format — bare domains, one per line — so it needs no parser of
-    its own, and the same DOMAIN_RE sweep drops the scraped junk it sometimes
-    carries ("mailto", "geoffk@apple.com" in the apple group).
-
-    `text`, when given, is the already-fetched body of `url`: resolving an iplist
-    selector has to download it to learn whether the selector exists, so it hands
-    over what it got instead of making this refetch.
+    Handles plain domains, full:, domain:, include: (recursive); skips
+    regexp:/keyword:, which RouterOS cannot express. iplist's bare-domain output
+    is a subset of this format, and the DOMAIN_RE sweep drops the scraped junk it
+    carries. `text`, when given, is the already-fetched body of `url`.
     """
     if seen is None:
         seen = set()
@@ -417,71 +349,41 @@ def parse_list(url, seen=None, text=None):
     return sub, full, skipped
 
 
-def rsc_service(svc, sub, full, cfg, single_scope=True):
-    """RouterOS commands that install/refresh one service's domains, idempotently.
+def rsc_service(svc, sub, full, cfg):
+    """RouterOS script that installs/refreshes one service's domains, idempotently.
 
-    Entries are tagged comment=<svc>. Untagged duplicates (manual entries for the
-    same domain) are adopted: removed first, re-added with the tag.
-
-    Two forms, because the two transports parse differently:
-
-    - single_scope=True (default; `/import` fast path and `render`): one `{ ... }`
-      block that runs in a single scope, so adoption is O(N) — the domains are
-      loaded into a keyed array once and each list is swept a single time with
-      O(1) lookups, instead of an O(table) `[find]` per domain.
-    - single_scope=False (stdin-pipe fallback): the interactive console evaluates
-      each piped line independently (no cross-line scope, and a ~1600-statement
-      single-line cap), so we fall back to self-contained per-domain lines. That
-      is O(N^2) on the router but only runs when `scp` is unavailable.
+    Entries are tagged comment=<svc>; untagged entries for the same domains are
+    adopted (removed, then re-added tagged). One `{ }` block so the keyed array
+    makes adoption O(N) instead of a [find] per domain.
     """
     L = cfg["list"]
-    # These entries pick no upstream: the router already sends all of its DoH
-    # through the tunnel (fresh-router.rsc pins the resolver into `list`), so a
-    # FWD entry's only job is address-list= — every address a LAN client resolves
-    # under one of these names lands in `list` and gets routed. type=FWD with no
-    # forward-to= resolves through the global use-doh-server, which is what we want.
-    # A domain can be in both lists (v2fly `domain:` + `full:` for the same name,
-    # e.g. itunes.apple.com). Each name must be added once or the second add
-    # fails "entry already exists"; match-subdomain=yes is the superset, so it
-    # wins over an exact duplicate.
+    fwd = f'forward-to={cfg["doh_forwarder"]} ' if cfg["doh_forwarder"] else ""
+    # A name can be in both lists (v2fly domain: + full:); match-subdomain=yes is
+    # the superset and wins, and each name must be added exactly once.
     domains = [(d, "yes") for d in sorted(sub)] + [(d, "no") for d in sorted(full - sub)]
-    if not single_scope:
-        out = [
-            f'/ip dns static remove [find comment="{svc}" address-list="{L}"]',
-            f'/ip firewall address-list remove [find list="{L}" comment="{svc}" dynamic=no]',
-        ]
-        for domain, match_sub in domains:
-            out += [
-                f':do {{/ip dns static remove [find name="{domain}" type=FWD address-list="{L}"]}} on-error={{}}',
-                f'/ip dns static add name={domain} type=FWD match-subdomain={match_sub} '
-                f'address-list={L} comment="{svc}"',
-                f':do {{/ip firewall address-list remove [find list="{L}" address="{domain}" dynamic=no]}} on-error={{}}',
-                f':do {{/ip firewall address-list add list={L} address={domain} comment="{svc}"}} on-error={{}}',
-            ]
-        return out
     out = [
         "{",
         f'/ip dns static remove [find comment="{svc}" address-list="{L}"]',
         f'/ip firewall address-list remove [find list="{L}" comment="{svc}" dynamic=no]',
         ':local ours [:toarray ""]',
     ]
-    # Short per-line :set statements (not one mega array literal) so the block
-    # also survives the interactive-console fallback, which caps line length.
+    # One :set per line rather than one array literal: the console caps line length.
     out += [f':set ($ours->"{domain}") 1' for domain, _ in domains]
-    # Adopt untagged duplicates: sweep each list once, remove entries whose
-    # name/address is one of ours (same reach as the old per-domain removes).
     out += [
         f':foreach e in=[/ip dns static find where address-list="{L}" type=FWD] '
         f'do={{:if ([:typeof ($ours->[/ip dns static get $e name])]!="nothing") '
         f'do={{/ip dns static remove $e}}}}',
+        # mtvpn:-commented entries are infra pins from fresh-router.rsc (the DoH
+        # resolver, the Telegram fetch host), not adoptable duplicates.
         f':foreach e in=[/ip firewall address-list find where list="{L}" dynamic=no] '
-        f'do={{:if ([:typeof ($ours->[/ip firewall address-list get $e address])]!="nothing") '
+        f'do={{:if ([:typeof ($ours->[/ip firewall address-list get $e address])]!="nothing" '
+        f'&& [:pick [:tostr [/ip firewall address-list get $e comment]] 0 6]!="mtvpn:") '
         f'do={{/ip firewall address-list remove $e}}}}',
     ]
     for domain, match_sub in domains:
         out += [
             f'/ip dns static add name={domain} type=FWD match-subdomain={match_sub} '
-            f'address-list={L} comment="{svc}"',
+            f'{fwd}address-list={L} comment="{svc}"',
             f':do {{/ip firewall address-list add list={L} address={domain} comment="{svc}"}} on-error={{}}',
         ]
     out.append("}")
@@ -508,11 +410,9 @@ def ssh_base(cfg):
 def scp_base(cfg, local, remote):
     """scp argv to copy `local` to the router as `remote`.
 
-    Either derived from cfg["ssh"] (swap the program to scp, keep pass-through
-    options, map ssh's -p PORT to scp's -P PORT, turn the host token into
-    host:remote) or, if cfg["scp"] is set, taken from that template with the
-    {local}/{remote} placeholders substituted — an escape hatch for topologies
-    the derivation gets wrong.
+    Derived from cfg["ssh"] (program swapped, ssh's -p PORT mapped to scp's -P
+    PORT, host token turned into host:remote), or taken from cfg["scp"] as a
+    template with {local}/{remote} substituted.
     """
     if cfg.get("scp"):
         return [t.replace("{local}", local).replace("{remote}", remote)
@@ -524,7 +424,7 @@ def scp_base(cfg, local, remote):
         raise SystemExit('no ssh target: set "ssh:" in the config or pass -r "ssh <host>"')
     host, opts, mapped, i = toks[-1], toks[:-1], [], 0
     while i < len(opts):
-        if opts[i] == "-p" and i + 1 < len(opts):  # ssh -p PORT -> scp -P PORT
+        if opts[i] == "-p" and i + 1 < len(opts):
             mapped += ["-P", opts[i + 1]]
             i += 2
         else:
@@ -533,14 +433,8 @@ def scp_base(cfg, local, remote):
     return ["scp", "-o", "BatchMode=yes"] + mapped + [local, f"{host}:{remote}"]
 
 
-def can_scp(cfg):
-    """Whether the /import fast path is usable: some ssh/scp target resolves."""
-    return bool(cfg.get("scp") or cfg.get("ssh"))
-
-
 def target(cfg):
-    """Short display name for the router: last token of the ssh command."""
-    return cfg["ssh"].split()[-1] if cfg["ssh"] else "(dry-run)"
+    return cfg["ssh"].split()[-1]
 
 
 # /import can exit 0 even when a line failed; scan its output for these too.
@@ -548,23 +442,11 @@ IMPORT_ERROR = re.compile(
     r"syntax error|failure|expected|no such item|does not match|bad command|invalid", re.I)
 
 
-def push(cfg, script, dry_run=False, pipe_script=None):
-    """Apply `script` to the router.
-
-    `script` is the single-scope form for the `/import` fast path. `pipe_script`,
-    if given, is the per-line form used for the stdin fallback (see rsc_service);
-    when omitted the script is self-contained enough to pipe as-is.
-    """
+def push(cfg, script, dry_run=False):
     if dry_run:
         print("\n".join(script) + "\n", end="")
         return
-    if can_scp(cfg):
-        try:
-            _push_import(cfg, "\n".join(script) + "\n")
-            return
-        except FileNotFoundError:  # scp binary missing -> fall back to the pipe
-            print("  scp not found; falling back to the stdin pipe (slower)")
-    _push_stdin(cfg, "\n".join(pipe_script or script) + "\n")
+    _push_import(cfg, "\n".join(script) + "\n")
 
 
 def _report(lines):
@@ -573,19 +455,8 @@ def _report(lines):
             print("  router:", l)
 
 
-def _push_stdin(cfg, text):
-    """Fallback transport: pipe the script into the interactive console."""
-    r = subprocess.run(
-        ssh_base(cfg),
-        input=text, capture_output=True, text=True, timeout=cfg["push_timeout"],
-    )
-    _report((r.stdout + r.stderr).splitlines())
-    if r.returncode != 0:
-        raise SystemExit(f"ssh to {target(cfg)} failed (exit {r.returncode})")
-
-
 def _push_import(cfg, text):
-    """Fast transport: scp the script to the router and run it with /import."""
+    """scp the script to the router and run it with /import."""
     remote = "mtvpn-import.rsc"
     fd, local = tempfile.mkstemp(suffix=".rsc")
     try:
@@ -607,7 +478,6 @@ def _push_import(cfg, text):
             if r.returncode != 0 or any(IMPORT_ERROR.search(l) for l in noise_free):
                 raise SystemExit(f"/import on {target(cfg)} failed")
         finally:
-            # Best-effort router cleanup, even if the import errored out.
             subprocess.run(
                 ssh_base(cfg) + [f':do {{/file remove [find name="{remote}"]}} on-error={{}}'],
                 capture_output=True, text=True, timeout=120,
@@ -625,8 +495,8 @@ def query(cfg, command):
 
 
 def named_services(args):
-    """The services one add/update/remove invocation covers: those named on the
-    command line, then everything --from-list carries, deduped by tag."""
+    """Services this invocation covers: those named on the command line, then
+    everything --from-list carries."""
     names = list(args.services)
     for src in (getattr(args, "from_list", None) or []):
         names += read_service_list(src)
@@ -639,14 +509,9 @@ def named_services(args):
     return out
 
 
-def record_config(cfg, config_path, args):
-    """Write back what `add` installed: the --from-list URLs, then the explicitly
-    named services the config's lists don't already carry.
-
-    Dedupe is by tag, not by spelling, at both levels: `add anthropic` must not
-    append a second entry when the config (or one of its lists) already carries
-    it as v2fly:anthropic.
-    """
+def record_config(cfg, args):
+    """Write back what `add` installed: the --from-list URLs, then the named
+    services the config's lists don't already carry."""
     changed = False
     for src in (args.from_list or []):
         if src not in cfg["service_lists"]:
@@ -664,12 +529,11 @@ def record_config(cfg, config_path, args):
             covered.add(service_tag(name))
             changed = True
     if changed:
-        save_config(config_path, cfg)
+        save_config(args.config, cfg)
 
 
-def cmd_add(cfg, args, config_path, persist=True):
-    """Install/refresh services. persist=False for `update`, which is a refresh of
-    what the config already points at and must not graft a one-off list into it."""
+def cmd_add(cfg, args, persist=True):
+    """persist=False for `update`, which must not graft a one-off list into the config."""
     services = named_services(args)
     if not services:
         raise SystemExit("nothing to add: no services given and no list entries")
@@ -677,41 +541,31 @@ def cmd_add(cfg, args, config_path, persist=True):
         svc, url, source, text = resolve_service(name)
         sub, full, skipped = parse_list(url, text=text)
         report_parse(svc, sub, full, skipped, source)
-        push(cfg, rsc_service(svc, sub, full, cfg), args.dry_run,
-             pipe_script=rsc_service(svc, sub, full, cfg, single_scope=False))
+        push(cfg, rsc_service(svc, sub, full, cfg), args.dry_run)
         if not args.dry_run:
             print(f"added '{svc}' ({len(sub) + len(full)} domains) on {target(cfg)}")
-    if persist and not args.dry_run and Path(config_path).exists():
-        record_config(cfg, config_path, args)
+    if persist and not args.dry_run and Path(args.config).exists():
+        record_config(cfg, args)
 
 
-def cmd_update(cfg, args, config_path):
-    # Pruning against a subset of the services would delete every service not
-    # named, so it is only offered for the full refresh — --urls-only is such a
-    # subset, and pruning against it would sweep every v2fly/iplist service.
+def cmd_update(cfg, args):
+    # Pruning against a subset would delete every service not named.
     if (args.services or args.urls_only) and args.prune:
         raise SystemExit("--prune only applies to a full update "
                          "(no service arguments, no --urls-only)")
-    # No explicit services: refresh the whole effective set — config services plus
-    # everything the hosted lists carry, which is how a list edited on the server
-    # reaches the router.
     args.services = args.services or expand_services(cfg, args.from_list or [])
     if args.urls_only:
-        # Your own domain lists change far more often than the curated upstreams,
-        # so this refreshes just them instead of re-fetching every service.
         args.services = [n for n in args.services if parse_selector(n)[0] == "url"]
         if not args.services:
             raise SystemExit("nothing to update: no raw-URL domain lists among the services")
     if not args.services:
         raise SystemExit("nothing to update: no services given and none in config")
-    cmd_add(cfg, args, config_path, persist=False)
+    cmd_add(cfg, args, persist=False)
     if args.prune:
         prune_services(cfg, args)
 
 
 def prune_services(cfg, args):
-    """Drop router services no longer in the effective set — how a service dropped
-    from a hosted list stops being tunneled."""
     if args.dry_run or not cfg["ssh"]:
         print("# --prune needs the router; skipped", file=sys.stderr)
         return
@@ -721,7 +575,7 @@ def prune_services(cfg, args):
         print(f"pruned '{svc}' from {target(cfg)}")
 
 
-def cmd_remove(cfg, args, config_path):
+def cmd_remove(cfg, args):
     services = named_services(args)
     if not services:
         raise SystemExit("nothing to remove: no services given and no list entries")
@@ -730,23 +584,19 @@ def cmd_remove(cfg, args, config_path):
         push(cfg, rsc_remove_service(svc, cfg), args.dry_run)
         if not args.dry_run:
             print(f"removed '{svc}' from {target(cfg)}")
-        if not args.dry_run and Path(config_path).exists():
+        if not args.dry_run and Path(args.config).exists():
             cfg["services"] = [s for s in cfg["services"] if service_tag(s) != svc]
-            save_config(config_path, cfg)
-    if not args.dry_run and Path(config_path).exists() and (args.from_list or []):
+            save_config(args.config, cfg)
+    if not args.dry_run and Path(args.config).exists() and (args.from_list or []):
         # the list itself goes too, else the next update reinstalls everything
         cfg["service_lists"] = [s for s in cfg["service_lists"] if s not in args.from_list]
-        save_config(config_path, cfg)
+        save_config(args.config, cfg)
 
 
 def router_service_tags(cfg):
-    """Service tags installed on the router, read off the DNS static entries.
-
-    DNS static and not the address list, so the router-side telegram-cidr script
-    (address-list entries only) is invisible here and `--prune` leaves it alone.
-    Untagged entries yield "" and are dropped: their tag would match every
-    adopted entry.
-    """
+    """Service tags on the router, read off the DNS static entries — so the
+    address-list-only telegram-cidr entries stay invisible to --prune. Untagged
+    entries yield "" and are dropped: that tag matches every adopted entry."""
     lines = query(
         cfg,
         ':foreach i in=[/ip dns static find where address-list="%s"] '
@@ -762,7 +612,7 @@ def cmd_list(cfg, args):
         'do={:put ([:tostr [/ip dns static get $i comment]] . "|" '
         '. [/ip dns static get $i name])}' % cfg["list"],
     )
-    services = {}
+    services: dict = {}
     for l in lines:
         if "|" in l:
             svc, name = l.split("|", 1)
@@ -774,22 +624,9 @@ def cmd_list(cfg, args):
                 print(f"   {n}")
 
 
-def cmd_render(cfg, args):
-    for name in args.services:
-        svc, url, source, text = resolve_service(name)
-        sub, full, skipped = parse_list(url, text=text)
-        report_parse(svc, sub, full, skipped, source)
-        print("\n".join(rsc_service(svc, sub, full, cfg)))
-
-
 def cmd_domains(cfg, args):
-    """Print the resolved domains for service(s) upstream. No router needed.
-
-    Subdomain-match domains print as-is; exact (v2fly full:) domains are prefixed
-    `full:` so the two match kinds stay distinguishable. A bare name prints one
-    block per source that carries it — the headers naming each source go to stderr
-    like every other diagnostic, so stdout stays a plain domain list to pipe.
-    """
+    """Print a service's domains upstream. Exact (full:) domains keep the prefix;
+    the source headers go to stderr so stdout stays a plain pipeable list."""
     for name in args.services:
         for svc, url, source, text in service_variants(name):
             sub, full, skipped = parse_list(url, text=text)
@@ -801,11 +638,8 @@ def cmd_domains(cfg, args):
 
 
 def list_services():
-    """Available v2fly service names (the filenames under data/).
-
-    Uses the git trees API, not contents: the data/ dir exceeds the contents
-    API's 1000-entry page cap and would silently truncate.
-    """
+    """v2fly service names (the filenames under data/), via the git trees API —
+    the contents API truncates at 1000 entries."""
     root = json.loads(fetch(V2FLY_TREE_API + "master"))
     data_sha = next(e["sha"] for e in root["tree"]
                     if e["path"] == "data" and e["type"] == "tree")
@@ -816,11 +650,8 @@ def list_services():
 def iplist_catalog():
     """Every (portal, group, site) triple iplist serves.
 
-    format=custom with a {group}|{site} template is the only endpoint that exposes
-    group membership; plain ?format=json does too, but ships the whole 40 MB config
-    dump to do it. It emits one line per domain, hence the dedupe. A site with no
-    wildcard domains at all never appears, which costs nothing — there would be
-    nothing to add from it anyway.
+    format=custom is the only endpoint exposing group membership without shipping
+    the 40 MB config dump ?format=json would. One line per domain, hence the dedupe.
     """
     out = set()
     for name, base in IPLIST_PORTALS:
@@ -845,7 +676,7 @@ def cmd_search(cfg, args):
     rows = []
     if args.source in (None, "iplist"):
         catalog = iplist_catalog()
-        sites = {}
+        sites: dict = {}
         for portal, group, site in catalog:
             sites[(portal, group)] = sites.get((portal, group), 0) + 1
         rows += [(f"iplist:{g}", p, "group", f"{n} site(s)") for (p, g), n in sites.items()]
@@ -853,7 +684,7 @@ def cmd_search(cfg, args):
     if args.source in (None, "v2fly"):
         try:
             rows += [(f"v2fly:{n}", "", "", "") for n in list_services()]
-        except OSError as e:  # a GitHub outage/rate-limit shouldn't hide iplist's half
+        except OSError as e:  # a GitHub outage shouldn't hide iplist's half
             print(f"# v2fly listing unavailable: {e}", file=sys.stderr)
     matched = [r for r in rows if q is None or q in r[0].lower()]
     for ident, portal, kind, extra in sorted(matched):
@@ -862,9 +693,8 @@ def cmd_search(cfg, args):
         print(f"# {len(matched)} match(es) for {args.query!r}", file=sys.stderr)
 
 
-def report_parse(svc, sub, full, skipped, source=None):
-    src = f" [{source}]" if source else ""
-    print(f"# {svc}{src}: {len(sub)} subdomain-match + {len(full)} exact domains",
+def report_parse(svc, sub, full, skipped, source):
+    print(f"# {svc} [{source}]: {len(sub)} subdomain-match + {len(full)} exact domains",
           file=sys.stderr)
     for s in skipped:
         print(f"#   skipped (unsupported on RouterOS): {s}", file=sys.stderr)
@@ -879,57 +709,44 @@ def main():
     ap.add_argument("-n", "--dry-run", action="store_true", help="print RouterOS commands, don't push")
     sp = ap.add_subparsers(dest="cmd", required=True)
 
-    for c, h in [("add", "fetch service list(s) and install (or refresh) them"),
-                 ("update", "re-fetch and refresh services (default: all from config)"),
-                 ("remove", "remove service(s) from the router"),
-                 ("render", "print RouterOS commands for service(s) to stdout"),
-                 ("domains", "print resolved domains for service(s) upstream to stdout")]:
-        p = sp.add_parser(c, help=h)
-        p.add_argument("services", nargs="*" if c in ("update", "add", "remove") else "+",
-                       help="iplist:<site|group>, v2fly:<name>, or a raw URL of a "
-                            "domain list, optionally named <tag>=<url> "
-                            "(a bare name means v2fly:)")
-        if c in ("add", "update", "remove"):
-            p.add_argument("-l", "--from-list", metavar="URL", action="append",
-                           help="URL or path of a hosted service list (one selector "
-                                "per line); repeatable. add/remove also record it "
-                                "in the config's service_lists:")
-        if c == "update":
-            p.add_argument("--urls-only", action="store_true",
-                           help="only refresh services whose source is a raw URL "
-                                "domain list, skipping the iplist/v2fly ones")
-            p.add_argument("--prune", action="store_true",
-                           help="also remove router services that are no longer in "
-                                "the config or its lists")
+    def service_parser(name, help_text):
+        p = sp.add_parser(name, help=help_text)
+        p.add_argument("services", nargs="*", help=SERVICES_HELP)
+        p.add_argument("-l", "--from-list", metavar="URL", action="append",
+                       help="URL or path of a hosted service list (one selector per line); "
+                            "repeatable. add/remove also record it in service_lists:")
+        return p
+
+    service_parser("add", "fetch service list(s) and install (or refresh) them"
+                   ).set_defaults(func=cmd_add)
+    p = service_parser("update", "re-fetch and refresh services (default: all from config)")
+    p.add_argument("--urls-only", action="store_true",
+                   help="only refresh services whose source is a raw URL domain list")
+    p.add_argument("--prune", action="store_true",
+                   help="also remove router services no longer in the config or its lists")
+    p.set_defaults(func=cmd_update)
+    service_parser("remove", "remove service(s) from the router").set_defaults(func=cmd_remove)
+
+    p = sp.add_parser("domains", help="print resolved domains for service(s) upstream to stdout")
+    p.add_argument("services", nargs="+", help=SERVICES_HELP)
+    p.set_defaults(func=cmd_domains)
 
     p = sp.add_parser("search", help="list selectors available from iplist and v2fly")
     p.add_argument("query", nargs="?", help="substring to filter selectors")
     p.add_argument("-s", "--source", choices=SOURCES, help="only search this source")
+    p.set_defaults(func=cmd_search)
 
     p = sp.add_parser("list", help="show services installed on the router")
     p.add_argument("-v", "--verbose", action="store_true", help="also list domains")
+    p.set_defaults(func=cmd_list)
 
     args = ap.parse_args()
     cfg = load_config(args.config)
     if args.router:
         cfg["ssh"] = args.router
-    if args.cmd not in ("render", "domains", "search") and not cfg["ssh"] and not args.dry_run:
+    if args.cmd not in ("domains", "search") and not cfg["ssh"] and not args.dry_run:
         raise SystemExit('no router: use -r "ssh <host>" or set "ssh:" in the config file')
-
-    if args.cmd == "add":
-        cmd_add(cfg, args, args.config)
-    elif args.cmd == "update":
-        cmd_update(cfg, args, args.config)
-    elif args.cmd == "remove":
-        cmd_remove(cfg, args, args.config)
-    elif args.cmd == "list":
-        cmd_list(cfg, args)
-    elif args.cmd == "render":
-        cmd_render(cfg, args)
-    elif args.cmd == "domains":
-        cmd_domains(cfg, args)
-    elif args.cmd == "search":
-        cmd_search(cfg, args)
+    args.func(cfg, args)
 
 
 if __name__ == "__main__":
