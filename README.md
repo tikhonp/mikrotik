@@ -15,8 +15,9 @@ Two parts, with a strict split of ownership:
 
 Two paths:
 
-- **Everything else** resolves via the ISP's DHCP-supplied servers, plain UDP/53
-  straight out the WAN (`use-peer-dns=yes`, no `servers=` set by hand).
+- **Everything else** resolves via the ISP's plain UDP/53 servers, straight out the
+  WAN — supplied by DHCP (`use-peer-dns=yes`, no `servers=` set by hand), or set by
+  hand on a [static WAN](#static-wan-address-no-isp-dhcp).
 - **Tunneled services** resolve via `https://dns.google/dns-query`. `fresh-router.rsc`
   creates a `/ip dns forwarders` entry named `vpn-doh` and pins `dns.google` to
   8.8.8.8 with a static A record and into `to_vpn_list` by hostname, so the DoH
@@ -157,6 +158,25 @@ lists, and `/import` it. Notes:
   `not_in_internet` back if you ever configure a port forward.**
 - To use mtvpn against a router set up some other way, give it the equivalent of the
   template's `mtvpn:*` rules and the `vpn-doh` forwarder.
+
+### Static WAN address (no ISP DHCP)
+
+Substitute for the `/ip dhcp-client` line in the template, and add `servers=` to
+`/ip dns set` — nothing fills `dynamic-servers` without the DHCP client. Plain
+UDP/53, no DoH: the DoH forwarder is for tunneled names only.
+
+```
+/ip address add address=203.0.113.42/24 interface=ether1
+/ip route add dst-address=0.0.0.0/0 gateway=203.0.113.1
+/ip dns set servers=192.0.2.1,192.0.2.2
+```
+
+Check the ISP resolvers did not end up in `to_vpn_list`, or the router's own
+queries get routed into the tunnel:
+
+```
+/ip firewall address-list print where list=to_vpn_list address=192.0.2.1
+```
 
 ## Migrating a router that predates the split DNS flow
 
