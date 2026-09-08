@@ -7,7 +7,7 @@
 #   4. From your workstation:     ./mtvpn.py -c <router>.yaml add anthropic youtube ...
 #
 # PREREQUISITES (before import)
-#   - Clean config:      /system reset-configuration no-defaults=yes skip-backup=yes
+#   - Clean config:      /system reset-configuration no-defaults=yes skip-backup=yes keep-users=yes
 #   - Container package: /system package print   must list an enabled "container".
 #                        It ships in the "Extra packages" archive (RB5009 = arm64),
 #                        not the routeros bundle. Without it RouterOS rejects the
@@ -42,6 +42,9 @@
 :local vpnTable "to_vpn_table"
 :local vpnMark "to_vpn_mark"
 
+# disk holding the container's layers and root-dir (a /disk slot name)
+:local containerDisk "usb1"
+
 # container internal /24: router side = .1, mihomo veth = .2 = the VPN gateway
 :local containerNet "192.168.89"
 :local vpnGateway ($containerNet . ".2")
@@ -54,17 +57,30 @@
 
 # PRECHECK device-mode.
 :local containerOk true
+:local deviceModeOk true
 :foreach need in={"container";"scheduler";"fetch"} do={
     :if ([/system device-mode get $need] != true) do={
-        :set containerOk false
+        :set deviceModeOk false
         :put ("!! device-mode blocks '" . $need . "' (mode=" . [/system device-mode get mode] . \
             ") - container setup will be SKIPPED")
         :log warning ("fresh-router: device-mode blocks " . $need)
     }
 }
-:if ($containerOk = false) do={
+:if ($deviceModeOk = false) do={
+    :set containerOk false
     :put "!! fix with: /system/device-mode/update mode=advanced container=yes scheduler=yes fetch=yes"
     :put "!! then confirm with the reset button / power cycle, and re-run this import."
+}
+
+# PRECHECK disk. layer-dir/tmpdir/root-dir all live on $containerDisk; without it
+# /container config set is the first thing to fail and everything after it in the
+# block - image, veth port, both watchdogs - never happens.
+:if ([:len [/disk find where slot=$containerDisk]] = 0) do={
+    :set containerOk false
+    :put ("!! no disk in slot '" . $containerDisk . "' - container setup will be SKIPPED")
+    :put ("!! plug the stick in, then: /disk format-drive [find slot=" . $containerDisk . \
+        "] file-system=ext4")
+    :log warning ("fresh-router: no disk in slot " . $containerDisk)
 }
 
 # bridges & ports
@@ -180,9 +196,9 @@
     :do {
         /interface veth add name=$vethName address=($containerNet . ".2/24") gateway=($containerNet . ".1")
         /interface bridge port add bridge=$containerIface interface=$vethName
-        /container config set registry-url=https://registry-1.docker.io tmpdir=usb1/container-tmp layer-dir=usb1/container-tmp/layer
+        /container config set registry-url=https://registry-1.docker.io tmpdir=($containerDisk . "/container-tmp") layer-dir=($containerDisk . "/container-tmp/layer")
         /container envs add key=SUB1 list=mihomo value=$subUrl
-        /container add remote-image=$image interface=$vethName envlists=mihomo dns=8.8.8.8,8.8.4.4 root-dir=usb1/container-tmp/docker/mihomo start-on-boot=yes
+        /container add remote-image=$image interface=$vethName envlists=mihomo dns=8.8.8.8,8.8.4.4 root-dir=($containerDisk . "/container-tmp/docker/mihomo") start-on-boot=yes
         :local restart "/container stop [find name~\"mihomo\"]; :delay 5s; /container start [find name~\"mihomo\"]; :log warning \"mihomo restarted: "
         # 1. container down: the veth stops answering. Probe the gateway itself -
         #    by then the VPN route is inactive and everything else fails open, so
@@ -198,11 +214,11 @@
         :put "container: ok"
     } on-error={
         :put "!! container setup FAILED - check: /system package print (container installed?),"
-        :put "!! /system device-mode print, /disk print (usb1 formatted ext4?)"
+        :put ("!! /system device-mode print, /disk print (" . $containerDisk . " formatted ext4?)")
         :log error "fresh-router: container setup failed"
     }
 } else={
-    :put "container: skipped (device-mode)"
+    :put "container: skipped (see the !! lines above)"
 }
 
 # system
