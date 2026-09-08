@@ -37,7 +37,7 @@
 :local lanList "LANiface"
 :local wanList "WANiface"
 
-# selective-VPN routing names. $vpnList must match `list:` in mtvpn.yaml.
+# selective-VPN routing names. $vpnList must match LIST in mtvpn.py.
 :local vpnList "to_vpn_list"
 :local vpnTable "to_vpn_table"
 :local vpnMark "to_vpn_mark"
@@ -50,7 +50,7 @@
 :local vpnGateway ($containerNet . ".2")
 
 # DoH resolver for tunneled services only. $dohForwarder must match
-# `doh_forwarder:` in mtvpn.yaml.
+# DOH_FORWARDER in mtvpn.py.
 :local dohHost "dns.google"
 :local dohIP "8.8.8.8"
 :local dohForwarder "vpn-doh"

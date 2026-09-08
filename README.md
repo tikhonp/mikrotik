@@ -95,17 +95,9 @@ only to a full `update` and leaves the router's own `telegram-cidr` entries alon
 
 ## Config
 
-`mtvpn.yaml`, or one file per router selected with `-c`:
+`mtvpn.yaml` holds only *what* to tunnel, so one file serves every router:
 
 ```yaml
-# full ssh command for reaching the router; anything ssh accepts
-ssh: ssh -J jumphost 10.230.1.1
-# optional scp override for the /import fast path; {local}/{remote} substituted
-# scp: scp -J jumphost {local} 10.230.1.1:{remote}
-# the address-list the router routes through the tunnel
-list: to_vpn_list
-# the /ip dns forwarders entry mtvpn points its FWD entries at
-doh_forwarder: vpn-doh
 service_lists:
   - https://files.example.com/mtvpn-tunneled.txt
 services:
@@ -113,9 +105,23 @@ services:
   - iplist:claude.ai
 ```
 
-`list:` and `doh_forwarder:` are the only router-side names mtvpn needs, and both
-must match `fresh-router.rsc`'s `$vpnList` / `$dohForwarder`. A `list:` no rule
-matches on fails silently: entries are written, nothing is routed, nothing errors.
+The two router-side names are constants in `mtvpn.py` — `LIST` (`to_vpn_list`) and
+`DOH_FORWARDER` (`vpn-doh`) — and must match `fresh-router.rsc`'s `$vpnList` /
+`$dohForwarder`. A `LIST` no rule matches on fails silently: entries are written,
+nothing is routed, nothing errors.
+
+## Reaching the router
+
+Without `-r`, mtvpn takes the `.1` of the network this machine is on: on `10.220.1.57`
+it talks to `10.220.1.1`, and prints which router it picked. `-r` names one instead:
+
+```sh
+./mtvpn.py -r 10.230.1.1 list                  # ssh 10.230.1.1
+./mtvpn.py -r 100.64.0.1:10.230.1.1 list       # ssh -J 100.64.0.1 10.230.1.1
+```
+
+`JUMPHOST:HOST` becomes ssh's (and scp's) `-J`, which is how you reach a router you
+are not on the LAN of. Key auth only — mtvpn runs ssh with `BatchMode=yes`.
 
 ## Usage
 
@@ -129,7 +135,7 @@ matches on fails silently: entries are written, nothing is routed, nothing error
 ./mtvpn.py remove netflix
 ./mtvpn.py list -v                 # what's installed on the router, by service
 
-./mtvpn.py -c mtvpn-hex.yaml add v2fly:openai   # another router
+./mtvpn.py -r 10.230.1.1 add v2fly:openai       # another router
 
 # no router needed
 ./mtvpn.py -n add v2fly:anthropic  # dry-run: print the RouterOS commands
@@ -137,8 +143,8 @@ matches on fails silently: entries are written, nothing is routed, nothing error
 ./mtvpn.py domains openai
 ```
 
-`domains` and `search` never touch the router; everything else takes `-r "ssh <...>"`
-to override the config's `ssh:`.
+`domains` and `search` never touch the router; everything else uses the discovered
+router unless `-r` names one.
 
 `add`/`update` are idempotent: entries tagged with the service comment are replaced
 wholesale, and pre-existing *untagged* entries for the same domains are adopted rather
@@ -176,24 +182,4 @@ queries get routed into the tunnel:
 
 ```
 /ip firewall address-list print where list=to_vpn_list address=192.0.2.1
-```
-
-## Migrating a router that predates the split DNS flow
-
-Routers imported from an older `fresh-router.rsc` send *all* DoH through the tunnel.
-On each one:
-
-```
-/ip dhcp-client set [find interface=ether1] use-peer-dns=yes
-/ip dns forwarders add name=vpn-doh doh-servers=https://dns.google/dns-query verify-doh-cert=yes
-/ip dns set use-doh-server=""
-/ip dns static add name=core.telegram.org type=FWD forward-to=vpn-doh comment="mtvpn:tg-fetch"
-/ip firewall address-list add list=to_vpn_list address=core.telegram.org comment="mtvpn:tg-fetch"
-/ip dns cache flush
-```
-
-then, from your workstation, rewrite every FWD entry with `forward-to=`:
-
-```sh
-./mtvpn.py -c mtvpn.yaml update
 ```

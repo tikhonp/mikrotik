@@ -12,13 +12,16 @@ tunnel) and an /ip firewall address-list hostname entry for the apex.
 Sources are named explicitly and never inferred: iplist:<site|group>,
 v2fly:<name>, a raw URL, or a bare name (= v2fly:). Requires python3 and ssh
 key auth to the router.
+
+The config is router-independent: the router is discovered from the local
+network, or given as -r HOST / -r JUMPHOST:HOST.
 """
 
 import argparse
 import json
 import os
 import re
-import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -43,14 +46,14 @@ SOURCES = ("iplist", "v2fly")
 NAMED_URL_RE = re.compile(r"^([a-z0-9][a-z0-9._-]*)=(?=[a-z][a-z0-9+.-]*://)", re.I)
 TAG_EXTENSIONS = (".txt", ".list", ".lst", ".dat", ".conf", ".md")
 
-DEFAULTS = {
-    "ssh": "",                # full ssh command, e.g. "ssh -J jumphost 10.0.0.1"
-    "scp": "",                # optional scp override, {local}/{remote} placeholders
-    "list": "to_vpn_list",    # address-list the router tunnels; from fresh-router.rsc
-    "doh_forwarder": "vpn-doh",  # /ip dns forwarders name; from fresh-router.rsc
-    # A full refresh writes ~2 objects per domain; a client-side timeout would
-    # abort /import partway and leave a service half-removed.
-    "push_timeout": 1800,
+# Router-side names, from fresh-router.rsc's $vpnList / $dohForwarder.
+LIST = "to_vpn_list"
+DOH_FORWARDER = "vpn-doh"
+# A full refresh writes ~2 objects per domain; a client-side timeout would abort
+# /import partway and leave a service half-removed.
+PUSH_TIMEOUT = 1800
+
+DEFAULTS: dict = {
     "service_lists": [],
     "services": [],
 }
@@ -110,10 +113,6 @@ def load_config(path):
     for key in ("services", "service_lists"):  # an empty "key:" line parses as ""
         if isinstance(cfg.get(key), str):
             cfg[key] = [cfg[key]] if cfg[key] else []
-    try:
-        cfg["push_timeout"] = int(cfg["push_timeout"])
-    except (TypeError, ValueError):
-        raise SystemExit(f"config: push_timeout must be a number, got {cfg['push_timeout']!r}")
     return cfg
 
 
@@ -349,15 +348,15 @@ def parse_list(url, seen=None, text=None):
     return sub, full, skipped
 
 
-def rsc_service(svc, sub, full, cfg):
+def rsc_service(svc, sub, full):
     """RouterOS script that installs/refreshes one service's domains, idempotently.
 
     Entries are tagged comment=<svc>; untagged entries for the same domains are
     adopted (removed, then re-added tagged). One `{ }` block so the keyed array
     makes adoption O(N) instead of a [find] per domain.
     """
-    L = cfg["list"]
-    fwd = f'forward-to={cfg["doh_forwarder"]} ' if cfg["doh_forwarder"] else ""
+    L = LIST
+    fwd = f"forward-to={DOH_FORWARDER} " if DOH_FORWARDER else ""
     # A name can be in both lists (v2fly domain: + full:); match-subdomain=yes is
     # the superset and wins, and each name must be added exactly once.
     domains = [(d, "yes") for d in sorted(sub)] + [(d, "no") for d in sorted(full - sub)]
@@ -390,51 +389,45 @@ def rsc_service(svc, sub, full, cfg):
     return out
 
 
-def rsc_remove_service(svc, cfg):
-    L = cfg["list"]
+def rsc_remove_service(svc):
+    L = LIST
     return [
         f'/ip dns static remove [find comment="{svc}" address-list="{L}"]',
         f'/ip firewall address-list remove [find list="{L}" comment="{svc}" dynamic=no]',
     ]
 
 
+def discover_router():
+    """The .1 of the network this machine is on."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 53))
+        ip = s.getsockname()[0]
+    finally:
+        s.close()
+    return ip.rsplit(".", 1)[0] + ".1"
+
+
+def ssh_parts(cfg):
+    """(extra ssh/scp options, host) from "HOST" or "JUMPHOST:HOST"."""
+    jump, sep, host = cfg["router"].rpartition(":")
+    if not host:
+        raise SystemExit(f"bad router address: {cfg['router']!r}")
+    return (["-J", jump] if sep else []), host
+
+
 def ssh_base(cfg):
-    cmd = shlex.split(cfg["ssh"])
-    if not cmd:
-        raise SystemExit('no ssh target: set "ssh:" in the config or pass -r "ssh <host>"')
-    if cmd[0] != "ssh":
-        cmd.insert(0, "ssh")
-    return [cmd[0], "-o", "BatchMode=yes"] + cmd[1:]
+    opts, host = ssh_parts(cfg)
+    return ["ssh", "-o", "BatchMode=yes"] + opts + [host]
 
 
 def scp_base(cfg, local, remote):
-    """scp argv to copy `local` to the router as `remote`.
-
-    Derived from cfg["ssh"] (program swapped, ssh's -p PORT mapped to scp's -P
-    PORT, host token turned into host:remote), or taken from cfg["scp"] as a
-    template with {local}/{remote} substituted.
-    """
-    if cfg.get("scp"):
-        return [t.replace("{local}", local).replace("{remote}", remote)
-                for t in shlex.split(cfg["scp"])]
-    toks = shlex.split(cfg["ssh"])
-    if toks and toks[0] == "ssh":
-        toks = toks[1:]
-    if not toks:
-        raise SystemExit('no ssh target: set "ssh:" in the config or pass -r "ssh <host>"')
-    host, opts, mapped, i = toks[-1], toks[:-1], [], 0
-    while i < len(opts):
-        if opts[i] == "-p" and i + 1 < len(opts):
-            mapped += ["-P", opts[i + 1]]
-            i += 2
-        else:
-            mapped.append(opts[i])
-            i += 1
-    return ["scp", "-o", "BatchMode=yes"] + mapped + [local, f"{host}:{remote}"]
+    opts, host = ssh_parts(cfg)
+    return ["scp", "-o", "BatchMode=yes"] + opts + [local, f"{host}:{remote}"]
 
 
 def target(cfg):
-    return cfg["ssh"].split()[-1]
+    return cfg["router"]
 
 
 # /import can exit 0 even when a line failed; scan its output for these too.
@@ -463,14 +456,14 @@ def _push_import(cfg, text):
         with os.fdopen(fd, "w") as f:
             f.write(text)
         s = subprocess.run(scp_base(cfg, local, remote),
-                           capture_output=True, text=True, timeout=cfg["push_timeout"])
+                           capture_output=True, text=True, timeout=PUSH_TIMEOUT)
         if s.returncode != 0:
             _report((s.stdout + s.stderr).splitlines())
             raise SystemExit(f"scp to {target(cfg)} failed (exit {s.returncode})")
         try:
             r = subprocess.run(
                 ssh_base(cfg) + [f"/import file-name={remote} verbose=no"],
-                capture_output=True, text=True, timeout=cfg["push_timeout"],
+                capture_output=True, text=True, timeout=PUSH_TIMEOUT,
             )
             out = (r.stdout + r.stderr).splitlines()
             _report(out)
@@ -541,7 +534,7 @@ def cmd_add(cfg, args, persist=True):
         svc, url, source, text = resolve_service(name)
         sub, full, skipped = parse_list(url, text=text)
         report_parse(svc, sub, full, skipped, source)
-        push(cfg, rsc_service(svc, sub, full, cfg), args.dry_run)
+        push(cfg, rsc_service(svc, sub, full), args.dry_run)
         if not args.dry_run:
             print(f"added '{svc}' ({len(sub) + len(full)} domains) on {target(cfg)}")
     if persist and not args.dry_run and Path(args.config).exists():
@@ -566,12 +559,12 @@ def cmd_update(cfg, args):
 
 
 def prune_services(cfg, args):
-    if args.dry_run or not cfg["ssh"]:
+    if args.dry_run:
         print("# --prune needs the router; skipped", file=sys.stderr)
         return
     stale = router_service_tags(cfg) - {service_tag(n) for n in args.services}
     for svc in sorted(stale):
-        push(cfg, rsc_remove_service(svc, cfg))
+        push(cfg, rsc_remove_service(svc))
         print(f"pruned '{svc}' from {target(cfg)}")
 
 
@@ -581,7 +574,7 @@ def cmd_remove(cfg, args):
         raise SystemExit("nothing to remove: no services given and no list entries")
     for name in services:
         svc = service_tag(name)  # tag only: removing must never need the network
-        push(cfg, rsc_remove_service(svc, cfg), args.dry_run)
+        push(cfg, rsc_remove_service(svc), args.dry_run)
         if not args.dry_run:
             print(f"removed '{svc}' from {target(cfg)}")
         if not args.dry_run and Path(args.config).exists():
@@ -600,7 +593,7 @@ def router_service_tags(cfg):
     lines = query(
         cfg,
         ':foreach i in=[/ip dns static find where address-list="%s"] '
-        'do={:put [:tostr [/ip dns static get $i comment]]}' % cfg["list"],
+        'do={:put [:tostr [/ip dns static get $i comment]]}' % LIST,
     )
     return {l.strip() for l in lines if l.strip()}
 
@@ -610,7 +603,7 @@ def cmd_list(cfg, args):
         cfg,
         ':foreach i in=[/ip dns static find where address-list="%s"] '
         'do={:put ([:tostr [/ip dns static get $i comment]] . "|" '
-        '. [/ip dns static get $i name])}' % cfg["list"],
+        '. [/ip dns static get $i name])}' % LIST,
     )
     services: dict = {}
     for l in lines:
@@ -704,8 +697,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="Selective-VPN domain routing on MikroTik from iplist/v2fly domain lists")
     ap.add_argument("-c", "--config", default="mtvpn.yaml", help="config file (default mtvpn.yaml)")
-    ap.add_argument("-r", "--router", metavar="SSH_CMD",
-                    help='ssh command for the router, e.g. "ssh -J jumphost 10.0.0.1"')
+    ap.add_argument("-r", "--router", metavar="ADDR",
+                    help='router address: "10.220.1.1", or "100.64.0.1:10.220.1.1" to '
+                         "jump through 100.64.0.1 (default: the .1 of the local network)")
     ap.add_argument("-n", "--dry-run", action="store_true", help="print RouterOS commands, don't push")
     sp = ap.add_subparsers(dest="cmd", required=True)
 
@@ -742,10 +736,10 @@ def main():
 
     args = ap.parse_args()
     cfg = load_config(args.config)
-    if args.router:
-        cfg["ssh"] = args.router
-    if args.cmd not in ("domains", "search") and not cfg["ssh"] and not args.dry_run:
-        raise SystemExit('no router: use -r "ssh <host>" or set "ssh:" in the config file')
+    cfg["router"] = args.router or ""
+    if args.cmd not in ("domains", "search") and not args.dry_run and not cfg["router"]:
+        cfg["router"] = discover_router()
+        print(f"# router: {cfg['router']}", file=sys.stderr)
     args.func(cfg, args)
 
 
