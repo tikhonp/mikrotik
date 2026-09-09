@@ -3,31 +3,11 @@
 Selective-VPN domain routing on MikroTik RouterOS 7. Domains for the services you
 pick go through your VPN gateway, everything else goes direct.
 
-Two parts, with a strict split of ownership:
+Two parts:
 
-- `fresh-router.rsc` — one-shot `/import` template for a factory-fresh router. Owns
-  *all* router config: the address-list, the `mtvpn:*` mangle rules, the routing
-  table, the DoH forwarder.
+- `fresh-router.rsc` — one-shot `/import` template for a factory-fresh router.
 - `mtvpn.py` — python3 CLI (stdlib only) that fetches domain lists and fills that
-  address-list over SSH. It owns only what is *in* the list.
-
-## DNS
-
-Two paths:
-
-- **Everything else** resolves via the ISP's plain UDP/53 servers, straight out the
-  WAN — supplied by DHCP (`use-peer-dns=yes`, no `servers=` set by hand), or set by
-  hand on a [static WAN](#static-wan-address-no-isp-dhcp).
-- **Tunneled services** resolve via `https://dns.google/dns-query`. `fresh-router.rsc`
-  creates a `/ip dns forwarders` entry named `vpn-doh` and pins `dns.google` to
-  8.8.8.8 with a static A record and into `to_vpn_list` by hostname, so the DoH
-  session itself rides the tunnel. mtvpn puts `forward-to=vpn-doh` on every
-  per-domain FWD entry it installs.
-
-So tunneled names resolve from the exit node's vantage point (the addresses that
-land in `to_vpn_list` are the ones nearest the path they will be fetched over),
-direct names resolve locally, and a dead tunnel costs you only the tunneled
-services — general DNS keeps working.
+  address-list over SSH.
 
 > LAN clients must use **the router as their only DNS server**, or subdomain
 > coverage silently degrades. With tailscale that means `--accept-dns=false` and
@@ -35,7 +15,7 @@ services — general DNS keeps working.
 
 ## Domain sources
 
-Every service names its source explicitly; nothing is inferred.
+Every service names its source explicitly.
 
 | entry | source |
 |---|---|
@@ -46,11 +26,6 @@ Every service names its source explicitly; nothing is inferred.
 | `anthropic` | same as `v2fly:anthropic` — a bare name is the v2fly alias |
 | `https://…` | a raw URL in either format — including your own list of domains |
 | `mine=https://…` | the same, with the router tag named explicitly |
-
-Any URL serving one domain per line works: that format is a subset of v2fly's.
-`full:`, `domain:` and `include:` are honoured; `regexp:`/`keyword:` are reported as
-skipped. `#` starts a comment anywhere in the line. The tag comes from the URL's
-last path segment minus its extension, or from `<tag>=` if you give one.
 
 iplist spreads its catalog over three near-disjoint portals, so `iplist:<selector>`
 tries each in turn and takes the first that has it. `search` shows which:
@@ -90,8 +65,7 @@ forget the URL in `service_lists:`; `update` never edits the config, so a one-of
 `-l` stays one-off.
 
 `--urls-only` narrows a refresh to services whose source is a raw URL. `--prune`
-removes every service tag on the router the effective set no longer names; it applies
-only to a full `update` and leaves the router's own `telegram-cidr` entries alone.
+removes every service tag on the router the effective set no longer names;
 
 ## Config
 
@@ -104,11 +78,6 @@ services:
   - v2fly:anthropic
   - iplist:claude.ai
 ```
-
-The two router-side names are constants in `mtvpn.py` — `LIST` (`to_vpn_list`) and
-`DOH_FORWARDER` (`vpn-doh`) — and must match `fresh-router.rsc`'s `$vpnList` /
-`$dohForwarder`. A `LIST` no rule matches on fails silently: entries are written,
-nothing is routed, nothing errors.
 
 ## Reaching the router
 
@@ -153,23 +122,17 @@ adopted, removed or pruned.
 
 ## Setting up a new router
 
-Open `fresh-router.rsc`, edit the PARAMETERS block, complete the PREREQUISITES it
-lists, and `/import` it. Notes:
-
-- **IPv6 is disabled** (takes effect on reboot). The selective-routing path is
-  IPv4-only, so a dual-stack client would otherwise reach an AAAA-capable service
-  direct over the WAN.
-- Firewall and mangle rules match on the interface lists `LANiface`/`WANiface`.
-- There are no `dstnat` rules, so the template carries no bogon-source drop. **Add
-  `not_in_internet` back if you ever configure a port forward.**
-- To use mtvpn against a router set up some other way, give it the equivalent of the
-  template's `mtvpn:*` rules and the `vpn-doh` forwarder.
+Use [`fresh-router.rsc`](fresh-router.rsc) as a template, modify params, maybe add static leases at the end, maybe static WAN address and rules to restrict IoT devices to LAN-only, then `/import` it. 
 
 ### Static WAN address (no ISP DHCP)
 
-Substitute for the `/ip dhcp-client` line in the template, and add `servers=` to
-`/ip dns set` — nothing fills `dynamic-servers` without the DHCP client. Plain
-UDP/53, no DoH: the DoH forwarder is for tunneled names only.
+Disable the DHCP client:
+
+```
+/ip dhcp-client disable dhcp1
+```
+
+Set a static address, route and DNS servers:
 
 ```
 /ip address add address=203.0.113.42/24 interface=ether1
@@ -177,9 +140,20 @@ UDP/53, no DoH: the DoH forwarder is for tunneled names only.
 /ip dns set servers=192.0.2.1,192.0.2.2
 ```
 
-Check the ISP resolvers did not end up in `to_vpn_list`, or the router's own
-queries get routed into the tunnel:
+### Restricting internet access for IoT devices
+
+Give the devices static leases so their addresses are stable, list those addresses,
+and drop anything they send outside the LAN:
 
 ```
-/ip firewall address-list print where list=to_vpn_list address=192.0.2.1
+/ip dhcp-server lease add address=10.230.1.50 mac-address=AA:BB:CC:DD:EE:01 
+/ip firewall address-list add list=iot-no-wan address=10.230.1.50
+```
+ 
+Than add a `forward` rule to drop any traffic from that list that is not going to the LAN:
+
+```
+/ip firewall filter add action=drop chain=forward comment="IoT: LAN only" \
+    src-address-list=iot-no-wan dst-address-list=!lan_nets \
+    place-before=[find chain=forward comment="jump to ICMP filters"]
 ```
