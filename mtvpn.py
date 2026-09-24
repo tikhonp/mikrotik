@@ -15,9 +15,14 @@ key auth to the router.
 
 The config is router-independent: the router is discovered from the local
 network, or given as -r HOST / -r JUMPHOST:HOST.
+
+`shadowrocket` renders the same service set as a Shadowrocket (iOS) config on
+top of a base file, and can PUT it to a copyparty server.
 """
 
 import argparse
+import base64
+import datetime
 import json
 import os
 import re
@@ -53,9 +58,15 @@ DOH_FORWARDER = "vpn-doh"
 # /import partway and leave a service half-removed.
 PUSH_TIMEOUT = 1800
 
+# Every key the config may hold: save_config writes back only these, so a key
+# missing here is silently dropped by the next add/remove.
 DEFAULTS: dict = {
     "service_lists": [],
     "services": [],
+    "shadowrocket_base": "",
+    "shadowrocket_upload": "",
+    "shadowrocket_user": "",
+    "shadowrocket_password": "",
 }
 
 SSH_NOISE = re.compile(r"WARNING|post-quantum|store now|upgraded|^\s*$")
@@ -117,7 +128,9 @@ def load_config(path):
 
 
 def save_config(path, cfg):
-    Path(path).write_text(dump_yaml({k: cfg[k] for k in DEFAULTS if k in cfg}))
+    # Unset scalars stay out, so a config without Shadowrocket keeps its shape.
+    Path(path).write_text(dump_yaml({k: cfg[k] for k in DEFAULTS
+                                     if k in cfg and (isinstance(cfg[k], list) or cfg[k])}))
 
 
 def split_named_url(name):
@@ -320,7 +333,17 @@ def parse_list(url, seen=None, text=None):
     sub, full, skipped = set(), set(), []
     base = url.rsplit("/", 1)[0] + "/"
 
-    for raw in (fetch(url) if text is None else text).splitlines():
+    if text is None:
+        try:
+            text = fetch(url)
+        except OSError as e:  # HTTPError/URLError are OSErrors too
+            hint = ""
+            if url.startswith(V2FLY_BASE) and getattr(e, "code", None) == 404:
+                name = url[len(V2FLY_BASE):]
+                hint = f" — v2fly has no list {name!r}; try 'mtvpn search {name}'"
+            raise SystemExit(f"{url}: {e}{hint}")
+
+    for raw in text.splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
@@ -686,6 +709,142 @@ def cmd_search(cfg, args):
         print(f"# {len(matched)} match(es) for {args.query!r}", file=sys.stderr)
 
 
+def shadowrocket_rules(entries):
+    """Shadowrocket [Rule] lines for (header, sub, full) service entries.
+
+    Same precedence as rsc_service: a name in both sets is DOMAIN-SUFFIX only.
+    Every rule is PROXY, so a name that some service's DOMAIN-SUFFIX already
+    covers (itself or a parent, e.g. api.foojay.io under foojay.io) is dropped
+    file-wide, and duplicates keep their first service. A service left with
+    nothing to add gets no header. Returns (lines, rule_count).
+    """
+    suffixes = set().union(*(sub for _, sub, _ in entries))
+
+    def covered(d, self_too):
+        labels = d.split(".")
+        return any(".".join(labels[i:]) in suffixes
+                   for i in range(0 if self_too else 1, len(labels) - 1))
+
+    seen, out = set(), []
+    for header, sub, full in entries:
+        rules = [f"DOMAIN-SUFFIX,{d},PROXY" for d in sorted(sub) if not covered(d, False)]
+        rules += [f"DOMAIN,{d},PROXY" for d in sorted(full) if not covered(d, True)]
+        rules = [r for r in rules if r not in seen]
+        if rules:
+            seen.update(rules)
+            out += ["", f"# {header}"] + rules
+    return out, len(seen)
+
+
+def shadowrocket_merge(base, rules):
+    """The base config with `rules` appended to its [Rule] section.
+
+    They go before the base's FINAL line if it has one — Shadowrocket stops at
+    the first match, so anything after FINAL is dead — else FINAL,DIRECT closes
+    them. Everything else in the base is copied verbatim.
+    """
+    lines = base.splitlines()
+    start = next((i for i, l in enumerate(lines) if l.strip().lower() == "[rule]"), None)
+    if start is None:
+        raise SystemExit("shadowrocket base: no [Rule] section to add the services to")
+    end = next((i for i in range(start + 1, len(lines))
+                if re.match(r"^\[[^\]]+\]$", lines[i].strip())), len(lines))
+    final = next((i for i in range(start + 1, end)
+                  if lines[i].strip().upper().startswith("FINAL,")), None)
+    pos = end if final is None else final
+    while pos > start + 1 and not lines[pos - 1].strip():  # land before trailing blanks
+        pos -= 1
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    block = ["", f"# Services, expanded by mtvpn from service_lists + services ({stamp})"]
+    block += rules
+    if final is None:
+        block.append("FINAL,DIRECT")
+        if pos == end < len(lines):
+            block.append("")  # a section header follows directly: keep them apart
+    return "\n".join(lines[:pos] + block + lines[pos:]) + "\n"
+
+
+def upload_copyparty(url, data, user, password):
+    """PUT `data` to `url` on a copyparty server, overwriting the file there.
+
+    `Replace: 1` is copyparty's overwrite switch for PUT, and it needs delete
+    permission on the volume: without either, copyparty keeps the old file and
+    stores the upload under a suffixed name with a 201 anyway — so the returned
+    fileurl is checked against the requested one.
+    """
+    headers = {"User-Agent": "mtvpn/1.0", "Replace": "1", "Accept": "application/json",
+               "Content-Type": "text/plain; charset=utf-8"}
+    if user:
+        # copyparty tries "user:pass", then each half, so this works with and
+        # without --usernames on the server.
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        headers["Authorization"] = f"Basic {token}"
+        auth = f"login {user!r}"
+    elif password:
+        headers["PW"] = password
+        auth = "password"
+    else:
+        auth = "no credentials"
+    req = urllib.request.Request(url, data=data.encode(), headers=headers, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body = r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise SystemExit(f"upload to {url}: HTTP {e.code} with {auth} — the account "
+                             "needs write and delete access to that folder")
+        raise SystemExit(f"upload to {url}: HTTP {e.code} {e.reason}")
+    except OSError as e:
+        raise SystemExit(f"upload to {url}: {e}")
+    try:
+        stored = json.loads(body).get("fileurl") or ""
+    except ValueError:
+        stored = ""
+    leaf = lambda u: urllib.parse.unquote(urllib.parse.urlparse(u).path.rstrip("/").rsplit("/", 1)[-1])
+    if stored and leaf(stored) != leaf(url):
+        raise SystemExit(f"upload to {url}: the server kept the old file and saved this "
+                         f"one as {stored} — the account ({auth}) needs delete access "
+                         "to overwrite")
+
+
+def cmd_shadowrocket(cfg, args):
+    """Render the Shadowrocket config: the base with every service's domains
+    appended to [Rule]. Uploads it when shadowrocket_upload is set."""
+    base_src = args.base or cfg.get("shadowrocket_base")
+    if not base_src:
+        raise SystemExit("no Shadowrocket base config: set shadowrocket_base: in the "
+                         "config or pass --base URL|PATH")
+    try:
+        base = fetch(base_src) if "://" in base_src else Path(base_src).expanduser().read_text()
+    except OSError as e:
+        raise SystemExit(f"shadowrocket base {base_src}: {e}")
+    # As in update: named services are the whole set, else config + lists + -l.
+    services = (named_services(args) if args.services
+                else expand_services(cfg, args.from_list or []))
+    if not services:
+        raise SystemExit("nothing to export: no services given and none in config")
+    entries = []
+    for name in services:
+        svc, url, source, text = resolve_service(name)
+        sub, full, skipped = parse_list(url, text=text)
+        report_parse(svc, sub, full, skipped, source)
+        entries.append((svc if parse_selector(name)[0] == "url" else name, sub, full))
+    rules, count = shadowrocket_rules(entries)
+    conf = shadowrocket_merge(base, rules)
+    if args.dry_run:
+        print(conf, end="")
+        return
+    Path(args.output).write_text(conf)
+    print(f"wrote {args.output} ({count} rules from {len(services)} service(s))")
+    dest = cfg.get("shadowrocket_upload")
+    if dest and not args.no_upload:
+        upload_copyparty(dest,
+                         conf,
+                         os.environ.get("MTVPN_UPLOAD_USER") or cfg.get("shadowrocket_user"),
+                         os.environ.get("MTVPN_UPLOAD_PW") or cfg.get("shadowrocket_password"))
+        print(f"uploaded to {dest}")
+
+
 def report_parse(svc, sub, full, skipped, source):
     print(f"# {svc} [{source}]: {len(sub)} subdomain-match + {len(full)} exact domains",
           file=sys.stderr)
@@ -720,6 +879,14 @@ def main():
                    help="also remove router services no longer in the config or its lists")
     p.set_defaults(func=cmd_update)
     service_parser("remove", "remove service(s) from the router").set_defaults(func=cmd_remove)
+    p = service_parser("shadowrocket", "render the services as a Shadowrocket config on top "
+                       "of shadowrocket_base (default: all from config), and upload it")
+    p.add_argument("-o", "--output", default="shadowrocket.conf",
+                   help="where to write it (default shadowrocket.conf)")
+    p.add_argument("--base", metavar="URL|PATH", help="base config (default: shadowrocket_base:)")
+    p.add_argument("--no-upload", action="store_true",
+                   help="don't PUT it to shadowrocket_upload: even if set")
+    p.set_defaults(func=cmd_shadowrocket)
 
     p = sp.add_parser("domains", help="print resolved domains for service(s) upstream to stdout")
     p.add_argument("services", nargs="+", help=SERVICES_HELP)
@@ -737,7 +904,8 @@ def main():
     args = ap.parse_args()
     cfg = load_config(args.config)
     cfg["router"] = args.router or ""
-    if args.cmd not in ("domains", "search") and not args.dry_run and not cfg["router"]:
+    if (args.cmd not in ("domains", "search", "shadowrocket")
+            and not args.dry_run and not cfg["router"]):
         cfg["router"] = discover_router()
         print(f"# router: {cfg['router']}", file=sys.stderr)
     args.func(cfg, args)

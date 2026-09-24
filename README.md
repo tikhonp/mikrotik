@@ -112,13 +112,45 @@ are not on the LAN of. Key auth only — mtvpn runs ssh with `BatchMode=yes`.
 ./mtvpn.py domains openai
 ```
 
-`domains` and `search` never touch the router; everything else uses the discovered
+`domains`, `search` and `shadowrocket` never touch the router; everything else uses the discovered
 router unless `-r` names one.
 
 `add`/`update` are idempotent: entries tagged with the service comment are replaced
 wholesale, and pre-existing *untagged* entries for the same domains are adopted rather
 than duplicated. Entries commented `mtvpn:*` are infrastructure pins and are never
 adopted, removed or pruned.
+
+## Shadowrocket (iOS, off the LAN)
+
+`shadowrocket` renders the same service set as a [Shadowrocket](https://apps.apple.com/app/shadowrocket/id932747118)
+config, so a phone away from home tunnels the same domains. It takes a hand-written
+base config (`[General]`, DNS, upstream `RULE-SET`s…) and appends one `# <service>`
+block of `DOMAIN-SUFFIX`/`DOMAIN` rules per service to its `[Rule]` section, before
+the base's `FINAL` line (or closes with `FINAL,DIRECT` if the base has none). A name
+another service's suffix already covers is dropped, so the file stays lean.
+
+```yaml
+shadowrocket_base: https://files.example.com/shadowrocket-base.conf   # URL or path
+shadowrocket_upload: https://files.example.com/phone/shadowrocket.conf
+shadowrocket_user: me          # optional
+shadowrocket_password: secret  # or env MTVPN_UPLOAD_PW (MTVPN_UPLOAD_USER for the login)
+```
+
+```sh
+./mtvpn.py shadowrocket                     # write shadowrocket.conf, upload if configured
+./mtvpn.py shadowrocket --no-upload -o sr.conf
+./mtvpn.py -n shadowrocket                  # print it instead
+./mtvpn.py shadowrocket v2fly:openai        # only the named services
+```
+
+The upload is an HTTP `PUT` to a [copyparty](https://github.com/9001/copyparty)
+server with `Replace: 1`. Point `shadowrocket_upload` at the file's real path, not a
+`/share/…` link (shares are read-only), then subscribe Shadowrocket to the share.
+With `shadowrocket_user` set it authenticates with HTTP Basic auth `user:password`,
+which copyparty accepts with or without `--usernames`; with only a password it sends
+copyparty's `PW` header. The account needs **write and delete** access to the
+folder: without delete, copyparty keeps the old file and stores the upload under a
+new name, which mtvpn reports as an error.
 
 ## Setting up a new router
 
