@@ -231,6 +231,9 @@
 /ip service set www disabled=yes
 /ip service set api disabled=yes
 /ip service set api-ssl disabled=yes
+# Newer RouterOS ships reverse-proxy enabled on :443 (seen on 7.24); older builds
+# have no such entry and a bare `set` on it would abort the import.
+:do { /ip service set reverse-proxy disabled=yes } on-error={}
 /tool graphing resource add store-on-disk=yes
 
 # Telegram IPv4 ranges (domain lists don't cover TG's raw-IP clients). The fetch
