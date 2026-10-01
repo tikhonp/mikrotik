@@ -1,6 +1,6 @@
 # mtvpn
 
-Selective-VPN domain routing on MikroTik RouterOS 7. Domains for the services you
+Selective-VPN domain routing on MikroTik RouterOS 7.24.5+. Domains for the services you
 pick go through your VPN gateway, everything else goes direct.
 
 Two parts:

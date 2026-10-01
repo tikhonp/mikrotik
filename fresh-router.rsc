@@ -7,7 +7,8 @@
 #   4. From your workstation:     ./mtvpn.py -c <router>.yaml add anthropic youtube ...
 #
 # PREREQUISITES (before import)
-#   - Clean config:      /system reset-configuration no-defaults=yes skip-backup=yes keep-users=yes
+#   - RouterOS 7.24.5+:  checked first; an older build aborts the import untouched.
+#   - Clean config:     /system reset-configuration no-defaults=yes skip-backup=yes keep-users=yes
 #   - Container package: /system package print   must list an enabled "container".
 #                        It ships in the "Extra packages" archive (RB5009 = arm64),
 #                        not the routeros bundle. Without it RouterOS rejects the
@@ -54,6 +55,38 @@
 :local dohHost "dns.google"
 :local dohIP "8.8.8.8"
 :local dohForwarder "vpn-doh"
+
+# PRECHECK RouterOS version. The template targets 7.24.5+ only and carries no
+# fallbacks for older builds (e.g. it sets reverse-proxy, absent before 7.24), so
+# refuse up front, before anything is configured, rather than half-apply.
+# version reads like "7.24.5 (stable)" or "7.25beta2 (testing)"; a beta/rc counts
+# as its x.y.0 release.
+:local minVer 7024005
+:local ver [/system resource get version]
+:local v $ver
+:foreach cut in={" ";"beta";"rc"} do={
+    :local p [:find $v $cut]
+    :if ([:typeof $p] != "nil") do={ :set v [:pick $v 0 $p] }
+}
+# Split on "." via substrings, not :find's start argument, whose off-by-one
+# semantics (search begins *after* start) are easy to get wrong.
+:local verNum 0
+:foreach scale in={1000000;1000;1} do={
+    :local d [:find $v "."]
+    :local part $v
+    :if ([:typeof $d] != "nil") do={
+        :set part [:pick $v 0 $d]
+        :set v [:pick $v ($d + 1) [:len $v]]
+    } else={
+        :set v ""
+    }
+    :if ([:len $part] > 0) do={ :set verNum ($verNum + [:tonum $part] * $scale) }
+}
+:if ($verNum < $minVer) do={
+    :put ("!! RouterOS " . $ver . " is too old: this template needs 7.24.5 or newer.")
+    :put "!! upgrade first: /system package update install"
+    :error "fresh-router: RouterOS too old, nothing configured"
+}
 
 # PRECHECK device-mode.
 :local containerOk true
@@ -231,9 +264,7 @@
 /ip service set www disabled=yes
 /ip service set api disabled=yes
 /ip service set api-ssl disabled=yes
-# Newer RouterOS ships reverse-proxy enabled on :443 (seen on 7.24); older builds
-# have no such entry and a bare `set` on it would abort the import.
-:do { /ip service set reverse-proxy disabled=yes } on-error={}
+/ip service set reverse-proxy disabled=yes
 /tool graphing resource add store-on-disk=yes
 
 # Telegram IPv4 ranges (domain lists don't cover TG's raw-IP clients). The fetch
@@ -313,6 +344,6 @@
 
 # IPv4-only selective routing: a dual-stack client would otherwise reach an
 # AAAA-capable service direct over the WAN. Takes effect on reboot.
-:do { /ipv6 settings set disable-ipv6=yes } on-error={}
+/ipv6 settings set disable-ipv6=yes
 
 :put "fresh-router: import finished"
