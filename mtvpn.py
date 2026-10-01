@@ -834,15 +834,20 @@ def cmd_shadowrocket(cfg, args):
     if args.dry_run:
         print(conf, end="")
         return
-    Path(args.output).write_text(conf)
-    print(f"wrote {args.output} ({count} rules from {len(services)} service(s))")
-    dest = cfg.get("shadowrocket_upload")
-    if dest and not args.no_upload:
+    summary = f"{count} rules from {len(services)} service(s)"
+    dest = None if args.no_upload else cfg.get("shadowrocket_upload")
+    # An uploaded config is kept only on the server unless -o asks for a copy;
+    # without an upload the local file is the only output, so it is written.
+    output = args.output or (None if dest else "shadowrocket.conf")
+    if output:
+        Path(output).write_text(conf)
+        print(f"wrote {output} ({summary})")
+    if dest:
         upload_copyparty(dest,
                          conf,
                          os.environ.get("MTVPN_UPLOAD_USER") or cfg.get("shadowrocket_user"),
                          os.environ.get("MTVPN_UPLOAD_PW") or cfg.get("shadowrocket_password"))
-        print(f"uploaded to {dest}")
+        print(f"uploaded to {dest}" + ("" if output else f" ({summary})"))
 
 
 def report_parse(svc, sub, full, skipped, source):
@@ -881,8 +886,9 @@ def main():
     service_parser("remove", "remove service(s) from the router").set_defaults(func=cmd_remove)
     p = service_parser("shadowrocket", "render the services as a Shadowrocket config on top "
                        "of shadowrocket_base (default: all from config), and upload it")
-    p.add_argument("-o", "--output", default="shadowrocket.conf",
-                   help="where to write it (default shadowrocket.conf)")
+    p.add_argument("-o", "--output",
+                   help="also write it to this file (default: only when not uploading, "
+                        "to shadowrocket.conf)")
     p.add_argument("--base", metavar="URL|PATH", help="base config (default: shadowrocket_base:)")
     p.add_argument("--no-upload", action="store_true",
                    help="don't PUT it to shadowrocket_upload: even if set")

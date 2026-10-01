@@ -137,7 +137,8 @@ shadowrocket_password: secret  # or env MTVPN_UPLOAD_PW (MTVPN_UPLOAD_USER for t
 ```
 
 ```sh
-./mtvpn.py shadowrocket                     # write shadowrocket.conf, upload if configured
+./mtvpn.py shadowrocket                     # upload if configured, else write shadowrocket.conf
+./mtvpn.py shadowrocket -o sr.conf          # upload and keep a local copy
 ./mtvpn.py shadowrocket --no-upload -o sr.conf
 ./mtvpn.py -n shadowrocket                  # print it instead
 ./mtvpn.py shadowrocket v2fly:openai        # only the named services
