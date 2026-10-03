@@ -158,6 +158,8 @@
 # that property stores nil and verification is inherited from the global one.
 /ip dns static add address=$dohIP name=$dohHost type=A
 /ip dns static add address=($lanNet . ".1") name=router.lan type=A
+/ip dns static add name=mask.icloud.com type=NXDOMAIN comment="block iCloud Private Relay"
+/ip dns static add name=mask-h2.icloud.com type=NXDOMAIN comment="block iCloud Private Relay"
 /ip dns forwarders add name=$dohForwarder doh-servers=("https://" . $dohHost . "/dns-query") verify-doh-cert=yes
 /ip dns set allow-remote-requests=yes verify-doh-cert=yes doh-max-concurrent-queries=200 doh-max-server-connections=40 doh-timeout=10s cache-size=16384KiB
 :put "stage: addressing/DHCP/DNS ok"

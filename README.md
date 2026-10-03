@@ -155,7 +155,7 @@ new name, which mtvpn reports as an error.
 
 ## Setting up a new router
 
-Use [`fresh-router.rsc`](fresh-router.rsc) as a template, modify params, maybe add static leases at the end, maybe static WAN address and rules to restrict IoT devices to LAN-only, then `/import` it. 
+Use [`fresh-router.rsc`](fresh-router.rsc) as a template, modify params, maybe add static leases at the end, maybe static WAN address, rules to restrict IoT devices to LAN-only and a guest VLAN, then `/import` it. 
 
 ### Static WAN address (no ISP DHCP)
 
@@ -190,3 +190,83 @@ Than add a `forward` rule to drop any traffic from that list that is not going t
     src-address-list=iot-no-wan dst-address-list=!lan_nets \
     place-before=[find chain=forward comment="jump to ICMP filters"]
 ```
+
+### Guest VLAN (UniFi APs)
+
+```
+/interface vlan add name=guest interface=LAN vlan-id=30
+/interface list add name=GUESTiface
+/interface list member add list=GUESTiface interface=guest
+/ip address add address=10.230.30.1/24 interface=guest
+/ip pool add name=guest_pool ranges=10.230.30.20-10.230.30.254
+/ip dhcp-server add name=dhcp-guest interface=guest address-pool=guest_pool lease-time=1h disabled=no
+/ip dhcp-server network add address=10.230.30.0/24 gateway=10.230.30.1 dns-server=10.230.30.1
+/ip firewall address-list add list=guest_nets address=10.230.30.0/24
+```
+
+Input: DNS on the guest address only, then drop the rest. Both go before "allow
+ping to the router", which has no interface match. `dst-address=` matters: the
+input chain accepts any of the router's addresses, so without it a guest could
+query DNS on `10.230.1.1` too.
+
+```
+/ip firewall filter add action=accept chain=input comment="guest: DNS only" \
+    in-interface-list=GUESTiface src-address-list=guest_nets dst-address=10.230.30.1 \
+    protocol=udp dst-port=53 place-before=[find comment="allow ping to the router"]
+/ip firewall filter add action=accept chain=input comment="guest: DNS only" \
+    in-interface-list=GUESTiface src-address-list=guest_nets dst-address=10.230.30.1 \
+    protocol=tcp dst-port=53 place-before=[find comment="allow ping to the router"]
+/ip firewall filter add action=drop chain=input comment="guest: nothing else on the router" \
+    in-interface-list=GUESTiface place-before=[find comment="allow ping to the router"]
+```
+
+Forward: internet only. VPN-routed guest traffic leaves through the `container`
+bridge, not the WAN, so `connection-mark=!to_vpn_mark` exempts it. That still
+drops unmarked traffic to mihomo itself (`192.168.89.2`). The explicit `LANiface`
+drop covers a tunneled name resolving to a LAN address while the VPN route is down
+(the lookup then falls back to `main`).
+
+```
+/ip firewall filter add action=drop chain=forward comment="guest: drop spoofed sources" \
+    in-interface-list=GUESTiface src-address-list=!guest_nets \
+    place-before=[find comment="jump to ICMP filters"]
+/ip firewall filter add action=drop chain=forward comment="guest: never to LAN" \
+    in-interface-list=GUESTiface out-interface-list=LANiface \
+    place-before=[find comment="jump to ICMP filters"]
+/ip firewall filter add action=drop chain=forward comment="guest: internet and VPN only" \
+    in-interface-list=GUESTiface out-interface-list=!WANiface connection-mark=!to_vpn_mark \
+    place-before=[find comment="jump to ICMP filters"]
+```
+
+Selective VPN for guests: the template's `mtvpn:conn-lan` / `mtvpn:route-pre` match
+`LANiface` only, so the guest VLAN gets its own pair. MSS clamping (by
+connection-mark) and masquerade (by WAN out list) already cover it, and `mtvpn.py`
+never touches mangle.
+
+```
+/ip firewall mangle add chain=prerouting action=mark-connection connection-mark=no-mark \
+    dst-address-list=to_vpn_list in-interface-list=GUESTiface new-connection-mark=to_vpn_mark \
+    passthrough=yes comment="mtvpn:conn-guest"
+/ip firewall mangle add chain=prerouting action=mark-routing connection-mark=to_vpn_mark \
+    in-interface-list=GUESTiface new-routing-mark=to_vpn_table passthrough=no \
+    comment="mtvpn:route-guest"
+```
+
+Last, carry VLAN 30 tagged on the bridge itself and on every port an AP (or a switch
+in front of APs) hangs off - adjust the port list. The main LAN stays untagged
+(pvid 1; RouterOS adds that entry on its own). VLAN filtering then drops frames
+tagged with any other VLAN; the RB5009 switch chip still offloads it.
+
+```
+/interface bridge vlan add bridge=LAN vlan-ids=30 tagged=LAN,ether2,ether3
+/interface bridge set LAN vlan-filtering=yes
+```
+
+On the UniFi side (no UniFi gateway, so the controller only tags):
+
+- Settings → Networks → new network, router *Third-party Gateway* (*VLAN Only* in
+  older versions), VLAN ID `30`. Leave the DHCP and gateway settings to the MikroTik.
+- Settings → WiFi → new SSID on that network, with **Client Device Isolation** on
+  (blocks guest-to-guest, which never reaches the router).
+- A UniFi switch between the router and the APs must carry VLAN 30 tagged on those
+  ports (the default *Allow All* port profile does).
