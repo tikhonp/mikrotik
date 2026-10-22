@@ -1,5 +1,8 @@
 # mtvpn
 
+> **This repo is archived.** I built a new project for this purpose,
+> [tikhonp/proxier](https://github.com/tikhonp/proxier). Use that one for new setups.
+
 Selective-VPN domain routing on MikroTik RouterOS 7.24.5+. Domains for the services you
 pick go through your VPN gateway, everything else goes direct.
 
